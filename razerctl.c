@@ -152,7 +152,7 @@ static void draw(const char*node,int pm,int manual,int rpm,int sp,int f1,int f2,
     }
     printf("   Kbd light : \033[1;33m%s\033[0m  (30%% when on)\n", kbd);
     printf("  --------------------------------------------\n");
-    printf("   m: mode  f: fan  +/-: rpm  k: kbd color  p: pause mon  r: refresh  q: quit\n");
+    printf("   m: mode  f: fan  +/-: rpm  k: kbd color  w: reclaim dGPU  p: pause mon  r: refresh  q: quit\n");
     if(msg&&*msg) printf("\n   \033[32m%s\033[0m\n",msg);
     fflush(stdout);
 }
@@ -181,6 +181,7 @@ static int tui(int fd,const char*node){
         if(ch=='q') break;
         else if(ch=='r'){ pm=get_pmode(fd); sp=get_fan_setpoint(fd); snprintf(msg,sizeof msg,"refreshed"); }
         else if(ch=='p'){ mon=!mon; pe=ce=-1; snprintf(msg,sizeof msg, mon?"monitor ON":"monitor PAUSED"); }
+        else if(ch=='w'){ system("setsid sh -c 'KWIN_DRM_DEVICES=/dev/dri/igpu kwin_wayland --replace >/dev/null 2>&1 &'"); snprintf(msg,sizeof msg,"KWin restarted (reclaim dGPU)"); }
         else if(ch=='k'){ kbi=(kbi+1)%5;
             if(kbi==0) kbd_off(fd);
             else { int r=0,g=0,b=0; if(kbi==1){r=g=b=255;} else if(kbi==2){r=255;} else if(kbi==3){r=128;b=128;} else {g=255;} kbd_color(fd,r,g,b); }
@@ -237,8 +238,14 @@ int main(int argc,char**argv){
             int r=system(!strcmp(a,"off") ? "systemctl disable --now nvidia-powerd" : "systemctl enable --now nvidia-powerd");
             printf("nvidia-powerd %s -> %s\n", a, r==0?"ok":"failed");
         } else { fprintf(stderr,"powerd: on|off|status\n"); return 1; }
+    } else if(!strcmp(argv[1],"reclaim")){
+        // restart KWin so it releases the dGPU after undocking -> dGPU returns to D3cold.
+        // run as the logged-in user (inherits Wayland session env); brief screen flicker.
+        printf("restarting KWin (brief flicker) to release the dGPU...\n");
+        int r=system("setsid sh -c 'KWIN_DRM_DEVICES=/dev/dri/igpu kwin_wayland --replace >/dev/null 2>&1 &'");
+        printf("%s\n", r==0?"kwin --replace launched":"failed");
     } else {
-        printf("usage: razerctl [get | rpm | mode <balanced|gaming|creator> | fan <auto|RPM> | kbd <white|red|purple|green|off> | powerd <on|off|status>]   (no args = TUI)\n");
+        printf("usage: razerctl [get | rpm | mode <balanced|gaming|creator> | fan <auto|RPM> | kbd <white|red|purple|green|off> | powerd <on|off|status> | reclaim]   (no args = TUI)\n");
     }
     close(fd); return 0;
 }
