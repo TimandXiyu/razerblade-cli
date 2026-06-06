@@ -14,21 +14,62 @@ It talks Razer's USB-HID vendor protocol directly over `hidraw` (no daemon, no l
 - **Keyboard** — solid-colour presets (white/red/purple/green) + off, brightness-locked
 - **TUI dashboard** — live fan RPM, battery draw, dGPU power state, CPU temp / package & core power, C-state residency; pausable polling
 
-## Build
-Needs only a C compiler:
+## Installation
+
+No experience needed — copy/paste each block into a terminal.
+
+### 1. Install the build tools
+You only need `git` and a C compiler (`gcc`). Pick your distro:
+
 ```sh
-make            # or: gcc -O2 -o razerctl razerctl.c
+# Arch / CachyOS / Manjaro
+sudo pacman -S --needed git base-devel
+
+# Ubuntu / Debian / Pop!_OS
+sudo apt update && sudo apt install -y git build-essential
+
+# Fedora
+sudo dnf install -y git gcc make
 ```
 
-## Permissions
-`hidraw` is root-owned, so either run with `sudo`, or install a udev rule for
-passwordless access by the logged-in user:
+### 2. Download and build
+```sh
+git clone https://github.com/TimandXiyu/blade-cli.git
+cd blade-cli
+make
+```
+This creates an executable called `razerctl` in the folder. If `make` isn't
+installed, run `gcc -O2 -o razerctl razerctl.c` instead.
+
+### 3. Try it (with sudo)
+`hidraw` (the device it talks to) is owned by root, so test with `sudo`:
+```sh
+sudo ./razerctl get
+```
+If you see your perf mode + fan setpoint printed, it works. 🎉
+
+### 4. (Optional) Run without `sudo` every time
+Install a udev rule so your normal user can use it directly:
 ```sh
 sudo tee /etc/udev/rules.d/99-razerctl.rules >/dev/null <<'EOF'
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="02b7", MODE="0660", TAG+="uaccess"
 EOF
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
+Now `./razerctl get` works without `sudo`.
+
+### 5. (Optional) Run it from anywhere
+Copy the binary into your `PATH` so you can just type `razerctl`:
+```sh
+sudo install -m755 razerctl /usr/local/bin/
+razerctl            # launches the dashboard
+```
+
+### Troubleshooting
+- **`no responding 1532:02b7 hidraw`** — your Razer model/USB id differs. Run
+  `lsusb | grep 1532` to find yours; this tool targets `1532:02b7` (Blade 16).
+- **`Permission denied`** — use `sudo`, or do step 4.
+- **`gcc: command not found`** — redo step 1.
 
 ## Usage
 ```sh
