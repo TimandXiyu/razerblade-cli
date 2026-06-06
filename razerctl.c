@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0-only
 // razer-cli - Razer Blade 16 control over hidraw.
 // Protocol derived from rnd-ash/razer-laptop-control (Ashcon Mohseninia), GPL-2.0.
 // razerctl - Razer Blade 16 (1532:02b7) fan/perf control via hidraw.

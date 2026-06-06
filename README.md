@@ -58,7 +58,7 @@ project for the base report format, and to [`tdakhran/razer-ctl`](https://github
 for Blade 16 reference.
 
 ## License
-GPL-2.0-or-later — see [LICENSE](LICENSE). Chosen to match `razer-laptop-control`,
+GPL-2.0 — see [LICENSE](LICENSE). Chosen to match `razer-laptop-control`,
 from whose GPL-2.0 source the protocol details were learned.
 
 ## Protocol reference (for forking / extending)
