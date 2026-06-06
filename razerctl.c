@@ -224,8 +224,21 @@ int main(int argc,char**argv){
         int m = !strcmp(argv[2],"balanced")?0:!strcmp(argv[2],"gaming")?1:!strcmp(argv[2],"creator")?2:-1;
         if(m<0){ fprintf(stderr,"mode: balanced|gaming|creator\n"); return 1; }
         int r=set_pmode(fd,m); printf("%s -> %s\n", r==0?"ok":"FAILED", modename(get_pmode(fd)));
+    } else if(!strcmp(argv[1],"powerd")&&argc==3){
+        // toggle nvidia-powerd (Dynamic Boost daemon). off => lets dGPU reach D3cold (~0W).
+        const char*a=argv[2];
+        if(!strcmp(a,"status")){
+            printf("nvidia-powerd: %s\n", system("systemctl is-active --quiet nvidia-powerd")==0?"active":"inactive");
+            char ps[16]="?\n"; FILE*f=fopen("/sys/bus/pci/devices/0000:01:00.0/power_state","r");
+            if(f){ if(!fgets(ps,sizeof ps,f)) ps[0]=0; fclose(f);}
+            printf("dGPU power_state: %s", ps);
+        } else if(!strcmp(a,"off")||!strcmp(a,"on")){
+            if(geteuid()!=0){ fprintf(stderr,"powerd %s needs root: sudo razerctl powerd %s\n",a,a); return 1; }
+            int r=system(!strcmp(a,"off") ? "systemctl disable --now nvidia-powerd" : "systemctl enable --now nvidia-powerd");
+            printf("nvidia-powerd %s -> %s\n", a, r==0?"ok":"failed");
+        } else { fprintf(stderr,"powerd: on|off|status\n"); return 1; }
     } else {
-        printf("usage: razerctl [get | rpm | mode <balanced|gaming|creator> | fan <auto|RPM> | kbd <white|red|purple|green|off>]   (no args = TUI)\n");
+        printf("usage: razerctl [get | rpm | mode <balanced|gaming|creator> | fan <auto|RPM> | kbd <white|red|purple|green|off> | powerd <on|off|status>]   (no args = TUI)\n");
     }
     close(fd); return 0;
 }

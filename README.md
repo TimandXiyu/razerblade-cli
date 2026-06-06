@@ -142,5 +142,6 @@ Control hidraw nodes for this device: `/dev/hidraw3..6` (any that answers Get-fi
 | `razerctl fan auto` | hand fan back to firmware |
 | `razerctl fan <2000-5300>` | manual fan RPM |
 | `razerctl kbd <white\|red\|purple\|green\|off>` | keyboard backlight |
+| `sudo razerctl powerd <on\|off\|status>` | toggle NVIDIA `nvidia-powerd` (Dynamic Boost); `off` lets the dGPU reach D3cold (~0W) on hybrid setups |
 | `razerctl` | launch TUI dashboard |
 
