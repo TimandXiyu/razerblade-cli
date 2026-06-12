@@ -75,14 +75,17 @@ razerctl            # launches the dashboard
 ```sh
 razerctl get                              # show perf mode + fan setpoint
 razerctl rpm                              # live fan RPM, 2s interval
-razerctl mode balanced|gaming|creator     # set performance mode
+razerctl mode balanced|gaming|creator|custom   # set performance mode
+razerctl boost                            # show CPU/GPU power sub-levels
+razerctl boost cpu high                   # set sub-level (Custom mode only)
 razerctl fan auto                         # return fan to firmware control
-razerctl fan 4000                         # manual RPM (clamped 2000-5300)
+razerctl fan 4000                         # manual RPM (clamped 2000-4800, Synapse range)
 razerctl fancurve                         # temp-driven auto fan (Ctrl-C restores auto)
+razerctl battery status                   # charge-limit EC byte (read; see note below)
 razerctl kbd white|red|purple|green|off   # keyboard backlight
 razerctl                                  # no args -> TUI dashboard
 ```
-TUI keys: `m` mode · `f` fan auto/manual · `c` fan curve · `+`/`-` RPM ±500 · `k` kbd colour · `p` pause monitor · `r` refresh · `q` quit.
+TUI keys: `m` mode (cycles incl. Custom) · `f` fan auto/manual · `c` fan curve · `+`/`-` RPM ±500 · `k` kbd colour · `e` EPP · `d` boost · `w` reclaim · `p` pause monitor · `r` refresh · `q` quit.
 
 > Note: the fan tachometer reading ramps slowly (~40–50 s to settle after a change).
 
@@ -141,10 +144,13 @@ Control hidraw nodes for this device: `/dev/hidraw3..6` (any that answers Get-fi
 | `razerctl epp` | show CPU energy-vs-performance bias (intel_pstate HWP, raw 0-255) + preset list |
 | `razerctl epp <0-255>` | set EPP (0=max perf … 255=max power-save). **TLP resets it on the next AC↔DC switch** (`CPU_ENERGY_PERF_POLICY_ON_AC/BAT`). TUI: `e` cycles presets 0/32/…/224/255. Sudo-less via `/etc/tmpfiles.d/epp-write.conf` (0666 on `energy_performance_preference`) |
 | `razerctl rpm` | live fan RPM (2s loop) |
-| `razerctl mode <balanced\|gaming\|creator>` | set perf mode |
+| `razerctl mode <balanced\|gaming\|creator\|custom>` | set perf mode. **Custom** (mode 4) unlocks the CPU/GPU boost sub-levels |
+| `razerctl boost` | show current CPU + GPU power sub-levels |
+| `razerctl boost <cpu\|gpu> <low\|medium\|high\|boost\|0-3>` | set a sub-level (CPU 0-3, GPU 0-2). Only takes effect in **Custom** mode |
 | `razerctl fan auto` | hand fan back to firmware |
-| `razerctl fan <2000-5300>` | manual fan RPM |
+| `razerctl fan <2000-4800>` | manual fan RPM (Synapse's rated range; was 2500-5300 — the old `args[0]=0x00` made the EC accept but not settle at the setpoint, fixed to `0x01` per USB capture) |
 | `razerctl fancurve` | temp-driven auto fan: rpm follows CPU + dGPU temps via EMA-smoothed two-segment curves (flat floor → engage step → ramp to max at an alarm temp); the shared fans take the louder demand. dGPU temp is read (`nvidia-smi`) only when the GPU is already awake. `Ctrl-C` restores auto. Also a TUI toggle (`c`). Curve thresholds are `#define`s at the top of `razerctl.c`. |
+| `razerctl battery status` | read the EC charge-limit byte (`0x07/0x8f`). **The setter is gated**: the readback returns a status byte, not the percentage, so a write can't be auto-verified yet. The setter opcode (`0x07/0x12`, arg `pct\|0x80`) is well-attested from the Synapse capture; to write anyway: `RAZERCTL_BATTERY_FORCE=1 razerctl battery <50-100\|off>` |
 | `razerctl kbd <white\|red\|purple\|green\|off>` | keyboard backlight |
 | `razerctl powerd <on\|off\|status>` | toggle NVIDIA `nvidia-powerd` (Dynamic Boost) at runtime (start/stop); `off` lets the dGPU reach D3cold (~0W). Sudo-less via polkit `49-nvidia-powerd.rules` (wheel may start/stop that unit). Non-persistent — reboot returns to off |
 | `razerctl power <max\|save\|status>` | `max`=start powerd (boost ≤175 W) · `save`=stop powerd (ceiling resets on next D3cold) · `status`=show powerd + power limits. Sudo-less (same polkit rule) |
