@@ -7,6 +7,7 @@ It talks Razer's USB-HID vendor protocol directly over `hidraw` (no daemon, no l
 > ⚠️ **Unofficial.** Reverse-engineered protocol. Tested on a Razer Blade 16
 > (USB `1532:02b7`, firmware 1.3). Opcodes can differ across models/firmware —
 > use at your own risk, especially manual fan control.
+> I am 100% not liable if the custom fan curve leads to any thermal damage on your laptop!
 
 ## Features
 - **Perf mode** — Balanced / Gaming / Creator / Custom (verified against CPU package power); Custom unlocks CPU/GPU boost sub-levels
@@ -16,8 +17,9 @@ It talks Razer's USB-HID vendor protocol directly over `hidraw` (no daemon, no l
 - **TUI dashboard** — live fan RPM, battery draw, dGPU power state, CPU temp / package & core power, C-state residency; pausable polling
 
 ## Installation
-
-No experience needed — copy/paste each block into a terminal.
+See below. But rememver everything here is only tested on my own laptop (with CachyOS which is based on Arch). Due to the bleeding edge
+nature of Arch, it is possible some of these installation steps are wrong. Hence, this requires you to know a bit about linux and pick
+your own fix (usually very simple if you really search or just ask an AI).
 
 ### 1. Install the build tools
 You only need `git` and a C compiler (`gcc`). Pick your distro:
@@ -91,6 +93,7 @@ TUI keys: `m` mode (cycles incl. Custom) · `1`-`4` set boost level (low/medium/
 In **Custom** mode the dashboard shows both engines' boost levels plus a legend (`1=low 2=medium 3=high 4=boost`) and which engine `1`-`4` currently edit; `g` flips between CPU and GPU. GPU has no `boost` level, so `4` is hidden when editing it.
 
 > Note: the fan tachometer reading ramps slowly (~40–50 s to settle after a change).
+> Note: the fan speed is partially controlled by the EC firmware, you might see the fan speed deviating from what you set. I don't have an solution to this and, honestly, it is probably a good EC firmware level safeguard to prebent from F-up your fan curve and burn your laptop.
 
 ## How it works
 Razer routes fan/perf/RGB control through 90-byte USB-HID feature reports
@@ -110,6 +113,8 @@ GPL-2.0 — see [LICENSE](LICENSE). Chosen to match `razer-laptop-control`,
 from whose GPL-2.0 source the protocol details were learned.
 
 ## Protocol reference (for forking / extending)
+I highly recommend you sniff your blade-specific opcode, it is merely some bytes usually sent by the Synapse to control the EC firmware. Hence, this is also why you only need a very small c program to emulate whatever Synapse is doing without all the fuss about Synapse's very heavy and ugly frontend. Since recent generations are often undergoing big changes, for example, intel and amd based blades are almost guaranteed to have a different opcode set... hence, this repo is more of a guideline to teach you how to reserse engineer and create your own version of the razerctl. Additionally, if you'd like to, you can raise a PR once you figure out your own razerctl so I can merge your PR.
+
 Unknown opcode? Don't guess writes — sniff what Synapse sends on Windows and port it:
 the full workflow (Wireshark + USBPcap capture, decode, on-device verification) is in
 [SKILL.md](SKILL.md), with the segment-capture driver script at [`sniff/capture.ps1`](sniff/capture.ps1).
