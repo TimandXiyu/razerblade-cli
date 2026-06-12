@@ -251,6 +251,7 @@ static void cpu_freq(int ncpu,int*mean,int*max){
 #define EPP_PATH0 "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
 static const int EPP_PRESET[]={0,32,64,96,128,160,192,224,255};   // knobs: 0..255 step 32 (+255 cap)
 #define NEPP ((int)(sizeof EPP_PRESET / sizeof EPP_PRESET[0]))
+#define NBATT 4   // battery charge-limit cycle: off/60/70/80
 static int epp_named(const char*s){ // standard intel_pstate tier name -> raw value, else -1
     if(!strcmp(s,"performance"))return 0;        if(!strcmp(s,"balance_performance"))return 128;
     if(!strcmp(s,"balance_power"))return 192;     if(!strcmp(s,"power"))return 255;     return -1; }
@@ -265,10 +266,16 @@ static int set_epp(int v){ // write EPP (raw 0-255) to every cpu. sudo-less IF e
         FILE*f=fopen(p,"w"); if(!f) continue; fprintf(f,"%d\n",v); if(fclose(f)==0) ok=0; }
     return ok; }
 static int epp_nearest(int v){ int bi=0,bd=1<<30; for(int i=0;i<NEPP;i++){ int d=v-EPP_PRESET[i]; if(d<0)d=-d; if(d<bd){bd=d;bi=i;} } return bi; }
-static void draw(const char*node,int pm,int manual,int curve,int alarm,int rpm,int sp,int f1,int f2,double bw,int ac,const char*gst,const char*gps,int temp,double pkgw,double corew,double busy,double deep,int meanf,int maxf,int epp,const char*eppname,int mon,const char*kbd,int powerd_on,const char*msg){
+static void draw(const char*node,int pm,int manual,int curve,int alarm,int rpm,int sp,int f1,int f2,double bw,int ac,const char*gst,const char*gps,int temp,double pkgw,double corew,double busy,double deep,int meanf,int maxf,int epp,const char*eppname,int mon,const char*kbd,int powerd_on,int cb,int gb,int btgt,const char*msg){
+    static const char*BN[4]={"low","medium","high","boost"};
     printf("\033[2J\033[H\033[1;36m  razerctl\033[0m  Blade 16 (1532:02b7) fw1.3  [%s]\n",node);
     printf("  --------------------------------------------\n");
-    printf("   Perf mode : \033[1;33m%-9s\033[0m\n",modename(pm));
+    if(pm==4){
+        printf("   Perf mode : \033[1;33m%-9s\033[0m  CPU \033[1;36m%-6s\033[0m  GPU \033[1;36m%-6s\033[0m\n",
+               modename(pm), (cb>=0&&cb<4)?BN[cb]:"?", (gb>=0&&gb<3)?BN[gb]:"?");
+        printf("   Boost set : editing \033[1;33m%s\033[0m  \033[1;90m1\033[0m=low \033[1;90m2\033[0m=medium \033[1;90m3\033[0m=high%s   \033[1;90m(g: CPU/GPU)\033[0m\n",
+               btgt==1?"CPU":"GPU", btgt==1?" \033[1;90m4\033[0m=boost":"");
+    } else printf("   Perf mode : \033[1;33m%-9s\033[0m\n",modename(pm));
     printf("   Fan       : \033[1;33m%-7s\033[0m target \033[1;33m%d rpm\033[0m (setpoint %d)%s\n",
            curve?"CURVE":(manual?"MANUAL":"Auto"), (curve||manual)?rpm:0, sp,
            alarm?"  \033[1;31m[ALARM]\033[0m":"");
@@ -291,7 +298,7 @@ static void draw(const char*node,int pm,int manual,int curve,int alarm,int rpm,i
     else       printf("   CPU bias  : \033[1;90mEPP n/a (no intel_pstate HWP)\033[0m\n");
     printf("   Kbd light : \033[1;33m%s\033[0m  (30%% when on)\n", kbd);
     printf("  --------------------------------------------\n");
-    printf("   m: mode  f: fan  c: curve  +/-: rpm  k: kbd color  e: EPP step  d: boost  w: reclaim  p: pause  r: refresh  q: quit\n");
+    printf("   m: mode  1-4/g: cpu/gpu boost (Custom)  f: fan  c: curve  +/-: rpm  k: kbd  e: EPP  d: dynboost  b: batt-limit  w: reclaim  p: pause  r/q\n");
     if(msg&&*msg) printf("\n   \033[32m%s\033[0m\n",msg);
     fflush(stdout);
 }
@@ -303,7 +310,7 @@ static int tui(int fd,const char*node){
     int curve=0,alarm=0,capplied=-1; double ec=-1,eg=-1;   // temp-curve toggle: EMA temps + last-applied rpm
     int pm=get_pmode(fd), sp=get_fan_setpoint(fd); manual = sp>0; if(manual) rpm=sp;
     long long pe=-1,ce=-1; double pts=0,cts=0; int ncpu=(int)sysconf(_SC_NPROCESSORS_ONLN); int mon=1;
-    int kbi=0; int powerd_on=powerd_enabled(); int eppi=epp_nearest(get_epp(NULL,0));
+    int kbi=0; int powerd_on=powerd_enabled(); int eppi=epp_nearest(get_epp(NULL,0)); int batti=0; int btgt=1;
     raw_on();
     for(;;){
         int f1=-1,f2=-1,temp=-1,ac=-1,meanf=-1,maxf=-1; double bw=0,pkgw=-1,corew=-1,busy=-1,deep=-1;
@@ -324,7 +331,8 @@ static int tui(int fd,const char*node){
             if(capplied<0||alarm||abs(rpm-capplied)>=FAN_STEP){ if(set_fan(fd,rpm)==0) capplied=rpm; }
         } else alarm=0;
         char eppname[24]; int epp=get_epp(eppname,sizeof eppname);
-        draw(node,pm,manual,curve,alarm,rpm,sp,f1,f2,bw,ac,gst,gps,temp,pkgw,corew,busy,deep,meanf,maxf,epp,eppname,mon,KBD[kbi].name,powerd_on,msg);
+        int cb=pm==4?get_boost(fd,1):-1, gb=pm==4?get_boost(fd,2):-1;   // boost levels only meaningful in Custom
+        draw(node,pm,manual,curve,alarm,rpm,sp,f1,f2,bw,ac,gst,gps,temp,pkgw,corew,busy,deep,meanf,maxf,epp,eppname,mon,KBD[kbi].name,powerd_on,cb,gb,btgt,msg);
         fd_set r; FD_ZERO(&r); FD_SET(0,&r); struct timeval tv={2,0};
         if(select(1,&r,0,0, (mon||curve)?&tv:NULL)<=0) continue;  // paused & no curve: block until key
         msg[0]=0; int ch=getchar();
@@ -359,6 +367,24 @@ static int tui(int fd,const char*node){
             else { set_fan_auto(fd); sp=get_fan_setpoint(fd); alarm=0; snprintf(msg,sizeof msg,"fan CURVE off -> AUTO"); } }
         else if(ch=='+'||ch=='='){ if(manual){ rpm+=500; if(rpm>4800)rpm=4800; set_fan(fd,rpm); sp=get_fan_setpoint(fd); snprintf(msg,sizeof msg,"rpm %d",rpm);} }
         else if(ch=='-'||ch=='_'){ if(manual){ rpm-=500; if(rpm<2000)rpm=2000; set_fan(fd,rpm); sp=get_fan_setpoint(fd); snprintf(msg,sizeof msg,"rpm %d",rpm);} }
+        else if(ch=='b'){ // cycle battery charge limit: off -> 60 -> 70 -> 80 -> off
+            static const int BP[NBATT]={0,60,70,80}; batti=(batti+1)%NBATT; int p=BP[batti];
+            int raw=get_charge_limit(fd);
+            int val = p? (p|0x80) : ((raw<0?0:raw)&0x7f);  // 0 = disable, keep stored value
+            int r=set_charge_limit(fd,val);
+            if(p) snprintf(msg,sizeof msg,"charge limit -> %d%% (wrote 0x%02x) - verify by watching charging stop near it",p,val);
+            else  snprintf(msg,sizeof msg,"charge limit OFF (wrote 0x%02x)",val);
+            if(r!=0) snprintf(msg,sizeof msg,"charge-limit write FAILED"); }
+        else if(ch=='g'){ btgt = btgt==1?2:1;   // switch which engine the 1-4 keys edit
+            snprintf(msg,sizeof msg,"editing %s boost (1=low 2=medium 3=high%s)",btgt==1?"CPU":"GPU",btgt==1?" 4=boost":""); }
+        else if(ch>='1'&&ch<='4'){ // set the selected engine's power sub-level directly (Custom mode only)
+            static const char*BN[4]={"low","medium","high","boost"};
+            int max = btgt==1?3:2, lvl=ch-'1';
+            if(lvl>max){ snprintf(msg,sizeof msg,"GPU has no 'boost' level (max=high); press g for CPU"); }
+            else { int r=set_boost(fd,btgt,lvl); int now=get_boost(fd,btgt);
+                if(r!=0) snprintf(msg,sizeof msg,"%s boost write FAILED",btgt==1?"CPU":"GPU");
+                else if(pm!=4) snprintf(msg,sizeof msg,"%s boost -> %s (stored; active only in Custom - press m)",btgt==1?"CPU":"GPU",BN[now]);
+                else snprintf(msg,sizeof msg,"%s boost -> %s",btgt==1?"CPU":"GPU",BN[now]); } }
     }
     raw_off(); return 0;
 }
@@ -429,7 +455,6 @@ int main(int argc,char**argv){
         // so a write cannot be auto-verified. Until we capture the real percent-readback, the
         // write is GATED behind RAZERCTL_BATTERY_FORCE=1 to avoid an unverifiable EC NVRAM write.
         int raw=get_charge_limit(fd);
-        int force = getenv("RAZERCTL_BATTERY_FORCE") && !strcmp(getenv("RAZERCTL_BATTERY_FORCE"),"1");
         if(argc==2||(argc==3&&!strcmp(argv[2],"status"))){
             printf("charge-limit EC byte (0x07/0x8f): %s%d (0x%02x) -- NOTE: this is a status byte, not the %%; readback unconfirmed\n",
                    raw<0?"read FAILED ":"", raw, raw<0?0:raw);
@@ -437,14 +462,9 @@ int main(int argc,char**argv){
             int off = !strcmp(argv[2],"off");
             int p = off ? -1 : atoi(argv[2]);
             if(!off && (p<50||p>100)){ fprintf(stderr,"battery: <50-100>|off|status  (Synapse range is 50-80)\n"); return 1; }
-            if(!force){
-                fprintf(stderr,"battery WRITE held: the charge-limit readback is unverified (see note in source).\n");
-                fprintf(stderr,"  The setter opcode is well-attested; to write anyway: RAZERCTL_BATTERY_FORCE=1 razerctl battery %s\n",argv[2]);
-                return 1;
-            }
-            int val = off ? ((raw<0?0:raw)&0x7f) : (p|0x80);
+            int val = off ? ((raw<0?0:raw)&0x7f) : (p|0x80);   // off = clear bit7, keep stored value
             int r=set_charge_limit(fd,val);
-            printf("%s charge limit %s (wrote 0x%02x). Verify by watching whether charging stops near the limit.\n",
+            printf("%s charge limit %s (wrote 0x%02x). Note: the EC readback can't confirm the %%; verify by watching charging stop near the limit.\n",
                    r==0?"ok":"FAILED", off?"disabled":argv[2], val);
         } else { fprintf(stderr,"battery [status | <50-100> | off]\n"); return 1; }
     } else if(!strcmp(argv[1],"powerd")&&argc==3){

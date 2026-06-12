@@ -85,7 +85,9 @@ razerctl battery status                   # charge-limit EC byte (read; see note
 razerctl kbd white|red|purple|green|off   # keyboard backlight
 razerctl                                  # no args -> TUI dashboard
 ```
-TUI keys: `m` mode (cycles incl. Custom) · `f` fan auto/manual · `c` fan curve · `+`/`-` RPM ±500 · `k` kbd colour · `e` EPP · `d` boost · `w` reclaim · `p` pause monitor · `r` refresh · `q` quit.
+TUI keys: `m` mode (cycles incl. Custom) · `1`-`4` set boost level (low/medium/high/boost) for the selected engine · `g` switch CPU/GPU boost target · `b` battery charge-limit cycle (off/60/70/80) · `f` fan auto/manual · `c` fan curve · `+`/`-` RPM ±500 · `k` kbd colour · `e` EPP · `d` dynboost (nvidia-powerd) · `w` reclaim · `p` pause monitor · `r` refresh · `q` quit.
+
+In **Custom** mode the dashboard shows both engines' boost levels plus a legend (`1=low 2=medium 3=high 4=boost`) and which engine `1`-`4` currently edit; `g` flips between CPU and GPU. GPU has no `boost` level, so `4` is hidden when editing it.
 
 > Note: the fan tachometer reading ramps slowly (~40–50 s to settle after a change).
 
