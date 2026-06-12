@@ -1,104 +1,89 @@
 ---
-name: razerctl
-description: Control a Razer Blade 16 (USB 1532:02b7) on Linux — fan speed, performance modes, CPU/GPU boost levels, keyboard RGB, battery charge limit, NVIDIA Dynamic Boost, and a live TUI power dashboard. Use when adjusting fans/thermals/power on a Razer Blade laptop, or as a protocol reference for extending Razer USB-HID control.
+name: razerctl-protocol-sniffing
+description: Guideline for agents/contributors working on razerctl (Razer Blade USB-HID control on Linux) — how to capture Razer Synapse's USB feature reports on Windows with Wireshark/USBPcap, decode the opcodes, and port them into the razerctl C program. Use when adding an unknown control (a Synapse knob razerctl lacks) or fixing a write the EC accepts but ignores.
 ---
 
-# razerctl — Razer Blade 16 control on Linux
+# Sniffing Synapse opcodes and porting them to razerctl
 
-A single-file, dependency-free C tool that speaks Razer's USB-HID vendor
-protocol directly over `hidraw` — no daemon, no libusb, no kernel module.
-This file orients a newcomer (human or agent) in minutes; the
-[README](README.md) has the full install walkthrough, command chart, and
-protocol table.
+razerctl talks to the Blade's EC through 90-byte USB-HID feature reports
+(see the README's **Protocol reference** for framing, CRC, and the known
+opcode table). When a control is unknown — or a "working" write is silently
+ignored — the ground truth is **what Razer Synapse itself sends on Windows**.
+This is the workflow that produced the Custom-mode, boost, battery-limit, and
+fan-`args[0]` discoveries; follow it rather than guessing opcodes.
 
-## Is this tool applicable?
+## When to sniff vs. when to guess
 
-- Hardware: reverse-engineered on a **Razer Blade 16, USB `1532:02b7`,
-  firmware 1.3**. Check yours with `lsusb | grep 1532`. Other Blades often
-  share the protocol but opcodes are **not guaranteed** — probe gently
-  (`razerctl get` is read-only) before writing anything.
-- OS: Linux with `hidraw` (any mainstream distro). Some features assume
-  intel_pstate (EPP), NVIDIA proprietary driver (`powerd`, dGPU temp), or
-  KWin/Wayland (`reclaim`) — everything else works without them.
+- Guessing nearby opcodes is fine for *reads* (harmless; status `0x05` =
+  not supported) — never for *writes* to anything persistent. Battery/EC
+  NVRAM writes are the genuinely harmful-if-wrong case.
+- Sniff when: firmware rejects your guessed write (`0x05`), a write is
+  accepted (`0x02`) but has no real effect, or the knob has no known class.
 
-## Quick start
+## Phase 1 — capture on Windows
 
-```sh
-git clone https://github.com/TimandXiyu/blade-cli.git
-cd blade-cli && make
-sudo ./razerctl get        # read-only probe: prints perf mode + fan setpoint
-./razerctl                 # no args = live TUI dashboard
-```
+1. Boot Windows with Synapse installed. Install Wireshark **with the USBPcap
+   component** (`winget install USBPcap.USBPcap` if it was skipped), then
+   **reboot once** — the capture driver only arms after a reboot.
+2. If Synapse offers a firmware update, **decline** — you want the protocol
+   of the firmware you actually run on Linux.
+3. Capture **one labeled segment per UI action**, across **all USB root
+   hubs** (you don't know which hub the EC HID hangs off). Use the driver
+   script shipped in this repo — **[`sniff/capture.ps1`](sniff/capture.ps1)**,
+   run as Administrator — which loops
+   `USBPcapCMD.exe -d \\.\USBPcap<N> -o <label>-hub<N>.pcap -A` per segment:
+   press Enter, perform exactly ONE Synapse action (e.g. "set charge limit
+   to 60"), press Enter to stop. Edit its `$actions` list to the knobs you're
+   after. Always start with a **baseline segment touching nothing** (to learn
+   the idle chatter) and a **sanity segment of a control you already know**
+   (validates the rig: you should see the known opcode).
+4. For value-carrying controls, capture a **sweep** (several distinct values:
+   2500/2900/3500/4000/4800 RPM…) so the value byte identifies itself.
+5. Record a notes file alongside the pcaps: what you clicked, in what order,
+   any UI surprises (e.g. "there is no fan slider, only a max-fan toggle").
+   The decode step lives or dies on accurate labels.
 
-To run without sudo, install the udev `uaccess` rule from README step 4.
+## Phase 2 — decode
 
-## Command map
+- Filter for SET_REPORT control transfers to the EC HID (VID `1532`; this
+  Blade 16 is PID `02b7`) with 90-byte payloads. In tshark terms, roughly:
+  `tshark -r seg.pcap -Y 'usb.transfer_type==2 && usb.data_len==90' -T fields -e usb.capdata`.
+- Read each frame against the known framing: byte6=class, byte7=cmd,
+  byte8..=args. Diff each segment against the baseline; ignore the constant
+  keyboard-LED chatter (`0x03 0x0a/0x0b` frames).
+- For sweeps, line the frames up with your labels — the byte tracking the
+  swept value is your value byte (RPM/100, `pct|0x80`, etc.).
+- Watch the **args[0] convention**: Synapse consistently sends `args[0]=0x01`
+  on fan/boost ops where old community code used `0x00`. With `0x00` the EC
+  may ACK (`0x02`) and even echo the setpoint on readback **without actually
+  applying it** — the classic silent failure this workflow exists to catch.
+- Note adjacent frames: Synapse sometimes follows a setter with an ambiguous
+  companion write (e.g. `0x07/0x0f` after the charge-limit set, which also
+  fires on an unrelated toggle). Don't blindly replicate those — try the bare
+  setter first.
 
-| Task | Command |
-|---|---|
-| Live dashboard (fan RPM, battery W, dGPU state, temps, C-states) | `razerctl` |
-| Performance mode | `razerctl mode balanced\|gaming\|creator\|custom` |
-| CPU/GPU power sub-levels (Custom mode only) | `razerctl boost cpu high` |
-| Manual fan / back to auto | `razerctl fan 4000` / `razerctl fan auto` |
-| Temperature-driven fan curve (foreground loop) | `razerctl fancurve` |
-| Battery charge limit | `razerctl battery 80` / `off` / `status` |
-| Keyboard backlight | `razerctl kbd white\|red\|purple\|green\|off` |
-| CPU energy/perf bias (intel_pstate EPP) | `razerctl epp 128` |
-| NVIDIA Dynamic Boost daemon | `razerctl powerd on\|off\|status` |
-| Release dGPU after undocking (KWin restart) | `razerctl reclaim` |
+## Phase 3 — port into razerctl.c
 
-## Things that will bite you (read before driving it)
+1. **Implement the read first** if one exists; confirm it against a state you
+   know (what Synapse/BIOS last set). Only then expose the write.
+2. Add a small helper following the existing pattern (`set_boost`,
+   `set_charge_limit`): build args, `snd()`, treat reply status `!=0x02` as
+   failure. Mirror Synapse's exact arg bytes — including `args[0]` and
+   per-zone duplication (fan ops go to BOTH zones 1 and 2).
+3. **Verify on-device before pushing**, with an independent signal, not just
+   the ACK: tachometer settling (give it 40–50 s), RAPL package power for
+   perf modes, readback where it exists, behavior (charging stops) where it
+   doesn't. If no readback can confirm a persistent write, say so in the
+   command's output and document the limitation honestly in the README.
+4. Update the README **Protocol reference** table and command chart in the
+   same commit. Unverified or ambiguous findings belong there as notes too
+   (e.g. the battery percent-readback is still unknown — `0x07/0x8f` returns
+   a status byte, not the percentage).
 
-1. **Manual fan is a sequence, not one write.** A bare RPM write is silently
-   ignored. You must send manual-enable (`0x0d/0x02`, arg3=1) to **both** fan
-   zones, then the RPM (`0x0d/0x01`) per zone — and the RPM write's `args[0]`
-   must be `0x01` (with `0x00` the EC echoes the setpoint back but doesn't
-   settle the fan there). `set_fan()` in `razerctl.c` does all of this.
-2. **The tachometer is slow.** Real measured RPM takes ~40–50 s to settle
-   after a change. Don't conclude "it didn't work" at 10 s — use the setpoint
-   readback (`0x0d/0x81`, instant) to confirm the command landed.
-3. **RPM range is 2000–4800** (Synapse's rated range; the tool clamps).
-4. **`boost` only works in Custom mode** — firmware rejects it otherwise
-   (status `0x05`). CPU has 4 levels (0–3), GPU has 3 (0–2).
-5. **The battery charge-limit write can't be auto-verified.** The setter
-   (`0x07/0x12`, arg = `pct|0x80`) is well-attested, but no readback opcode
-   for the stored percentage is known — `0x07/0x8f` returns a status byte.
-   Verify behaviorally: watch charging stop near the limit.
-6. **Never run `razerctl reclaim` under sudo.** It restarts KWin bound to the
-   iGPU, which needs the *user's* Wayland session env; under root it silently
-   no-ops and the dGPU is never released. Run the whole tool sudo-less.
-7. **Don't poll the dGPU with `nvidia-smi` to "check" it's asleep** — that
-   wakes it. Read sysfs (`/sys/bus/pci/devices/.../power_state`) instead;
-   the TUI and fancurve already do this (a D3cold dGPU is never woken).
-8. **EPP is transient under TLP**: TLP rewrites it on every AC↔battery
-   switch, so `razerctl epp` is a live nudge until the next power change.
-9. **`powerd on` is non-persistent** (runtime start/stop via polkit, not
-   enable/disable) — a reboot returns to off, which is what lets the dGPU
-   reach D3cold.
-10. **After suspend/resume the hidraw `uaccess` ACL can drop** (the HID
-    re-enumerates). If razerctl suddenly reports
-    `no responding 1532:02b7 hidraw`, don't reach for sudo — re-trigger udev:
-    `sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw --action=add`
+## Known open items (good first sniffs)
 
-## Extending / porting to another Blade
-
-- The full opcode table (framing, classes, args, CRC) is in the README's
-  **Protocol reference** section. All ops are 90-byte feature reports via
-  `HIDIOCSFEATURE`/`HIDIOCGFEATURE`; reply status `0x02`=OK, `0x05`=not
-  supported, `0x01`=busy, `0x03`=fail.
-- Start by probing Get-firmware (`0x00/0x81`) on each `hidraw` node to find
-  the one that answers; that's the control node.
-- When firmware rejects a write, suspect (in order): wrong `args[0]`
-  constant, missing per-zone duplication, a mode precondition (e.g. Custom
-  for boost), or a genuinely different opcode on your model.
-- The fan-curve tunables (`CPU_T_LO/HI`, `GPU_T_LO/HI`, `EMA_UP/DOWN`,
-  `FAN_STEP`, `FAN_LOOP_S`) are `#define`s at the top of the curve block in
-  `razerctl.c`.
-
-## Provenance
-
-Protocol knowledge derives from
-[`rnd-ash/razer-laptop-control`](https://github.com/rnd-ash/razer-laptop-control)
-and [openrazer](https://github.com/openrazer/openrazer), refined and corrected
-against a USB capture of Razer Synapse on Windows (fan `args[0]` fix, Custom
-mode, boost levels, charge limit). GPL-2.0.
+- **Battery charge-limit readback**: capture a Synapse session that *displays*
+  an existing limit on launch — the read it issues is the missing opcode.
+  Until then the setter can't be auto-verified.
+- Anything answering `0x05` in the README table on other Blade models —
+  the same workflow ports razerctl across the lineup.

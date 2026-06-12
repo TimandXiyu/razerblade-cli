@@ -452,8 +452,7 @@ int main(int argc,char**argv){
         // EC battery charge limit. SETTER opcode is well-attested from the Synapse capture
         // (0x07/0x12 arg = pct|0x80; 60->bc 65->c1 80->d0 off->41), BUT the readback (0x07/0x8f)
         // does NOT return the percentage -- it gives a status byte (0x02 in Windows, 0x00 here),
-        // so a write cannot be auto-verified. Until we capture the real percent-readback, the
-        // write is GATED behind RAZERCTL_BATTERY_FORCE=1 to avoid an unverifiable EC NVRAM write.
+        // so a write cannot be auto-verified; verify behaviorally (charging stops near the limit).
         int raw=get_charge_limit(fd);
         if(argc==2||(argc==3&&!strcmp(argv[2],"status"))){
             printf("charge-limit EC byte (0x07/0x8f): %s%d (0x%02x) -- NOTE: this is a status byte, not the %%; readback unconfirmed\n",

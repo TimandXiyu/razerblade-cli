@@ -9,8 +9,9 @@ It talks Razer's USB-HID vendor protocol directly over `hidraw` (no daemon, no l
 > use at your own risk, especially manual fan control.
 
 ## Features
-- **Perf mode** — Balanced / Gaming / Creator (verified against CPU package power)
-- **Fan** — manual RPM (2000–5300) or auto
+- **Perf mode** — Balanced / Gaming / Creator / Custom (verified against CPU package power); Custom unlocks CPU/GPU boost sub-levels
+- **Fan** — manual RPM (2000–4800), auto, or a temp-driven curve (`fancurve`)
+- **Battery charge limit** — set/disable (opcode from a Synapse USB capture)
 - **Keyboard** — solid-colour presets (white/red/purple/green) + off, brightness-locked
 - **TUI dashboard** — live fan RPM, battery draw, dGPU power state, CPU temp / package & core power, C-state residency; pausable polling
 
@@ -81,7 +82,7 @@ razerctl boost cpu high                   # set sub-level (Custom mode only)
 razerctl fan auto                         # return fan to firmware control
 razerctl fan 4000                         # manual RPM (clamped 2000-4800, Synapse range)
 razerctl fancurve                         # temp-driven auto fan (Ctrl-C restores auto)
-razerctl battery status                   # charge-limit EC byte (read; see note below)
+razerctl battery 80                       # battery charge limit (50-100, or off/status; see note below)
 razerctl kbd white|red|purple|green|off   # keyboard backlight
 razerctl                                  # no args -> TUI dashboard
 ```
@@ -109,6 +110,10 @@ GPL-2.0 — see [LICENSE](LICENSE). Chosen to match `razer-laptop-control`,
 from whose GPL-2.0 source the protocol details were learned.
 
 ## Protocol reference (for forking / extending)
+Unknown opcode? Don't guess writes — sniff what Synapse sends on Windows and port it:
+the full workflow (Wireshark + USBPcap capture, decode, on-device verification) is in
+[SKILL.md](SKILL.md), with the segment-capture driver script at [`sniff/capture.ps1`](sniff/capture.ps1).
+
 All ops are a 90-byte report sent via `HIDIOCSFEATURE` (then `HIDIOCGFEATURE` to read the reply).
 Framing: `byte0`=report id `0x00`, `byte1`=status, `byte2`=transaction id **`0x1f`**, `byte5`=data_size,
 `byte6`=command class, `byte7`=command id, `byte8..`=args, `byte89`=CRC (`XOR` of bytes `2..87`).
@@ -131,6 +136,8 @@ Reply **status byte**: `0x02`=OK, `0x05`=not-supported, `0x01`=busy, `0x03`=fail
 | Kbd brightness read | `0x03` | `0x83` | `0x03` | `[0x01,0x05,0x00]` | in reply `args[2]` |
 | **Kbd row colours** | `0x03` | `0x0b` | `0x34` | `[0xff,row,0x00,0x0f, ...45 bytes RGB]` | 6 rows (0-5) × 15 keys × R,G,B at `args[7]` |
 | **Kbd commit frame** | `0x03` | `0x0a` | `0x02` | `[0x05,0x00]` | apply uploaded matrix (custom effect) |
+| **Battery: set charge limit** | `0x07` | `0x12` | `0x01` | `[pct\|0x80]` | bit7=enable (60→`0xbc`, 80→`0xd0`); write with bit7 clear = disable, keeps the value (`0x41`) |
+| Battery: charge-limit read | `0x07` | `0x8f` | `0x01` | `[0x00]` | returns a STATUS byte, **not** the % — the true percent-readback opcode is still unknown |
 
 CRC reference (C):
 ```c
@@ -152,7 +159,7 @@ Control hidraw nodes for this device: `/dev/hidraw3..6` (any that answers Get-fi
 | `razerctl fan auto` | hand fan back to firmware |
 | `razerctl fan <2000-4800>` | manual fan RPM (Synapse's rated range; was 2500-5300 — the old `args[0]=0x00` made the EC accept but not settle at the setpoint, fixed to `0x01` per USB capture) |
 | `razerctl fancurve` | temp-driven auto fan: rpm follows CPU + dGPU temps via EMA-smoothed two-segment curves (flat floor → engage step → ramp to max at an alarm temp); the shared fans take the louder demand. dGPU temp is read (`nvidia-smi`) only when the GPU is already awake. `Ctrl-C` restores auto. Also a TUI toggle (`c`). Curve thresholds are `#define`s at the top of `razerctl.c`. |
-| `razerctl battery status` | read the EC charge-limit byte (`0x07/0x8f`). **The setter is gated**: the readback returns a status byte, not the percentage, so a write can't be auto-verified yet. The setter opcode (`0x07/0x12`, arg `pct\|0x80`) is well-attested from the Synapse capture; to write anyway: `RAZERCTL_BATTERY_FORCE=1 razerctl battery <50-100\|off>` |
+| `razerctl battery <50-100\|off\|status>` | set / disable / read the EC charge limit. Setter = `0x07/0x12`, arg `pct\|0x80` (well-attested from the Synapse capture). **Caveat: no readback can confirm the stored %** — `0x07/0x8f` returns a status byte, not the percentage — so verify behaviorally (charging stops near the limit). TUI: `b` cycles off/60/70/80 |
 | `razerctl kbd <white\|red\|purple\|green\|off>` | keyboard backlight |
 | `razerctl powerd <on\|off\|status>` | toggle NVIDIA `nvidia-powerd` (Dynamic Boost) at runtime (start/stop); `off` lets the dGPU reach D3cold (~0W). Sudo-less via polkit `49-nvidia-powerd.rules` (wheel may start/stop that unit). Non-persistent — reboot returns to off |
 | `razerctl power <max\|save\|status>` | `max`=start powerd (boost ≤175 W) · `save`=stop powerd (ceiling resets on next D3cold) · `status`=show powerd + power limits. Sudo-less (same polkit rule) |
