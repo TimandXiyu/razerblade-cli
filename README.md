@@ -120,10 +120,10 @@ Reply **status byte**: `0x02`=OK, `0x05`=not-supported, `0x01`=busy, `0x03`=fail
 | Get serial | `0x00` | `0x82` | `0x16` | — | |
 | **Get perf mode** | `0x0d` | `0x82` | `0x04` | `[0x00,0x01]` | mode in reply `args[2]`; 0=Bal 1=Gaming 2=Creator |
 | **Set perf mode** | `0x0d` | `0x02` | `0x04` | `[0x00,0x01,mode,fanflag]` | mode in **args[2]**; `fanflag`=1 if manual fan active |
-| Get CPU/GPU boost | `0x0d` | `0x87` | `0x03` | `[0x00,zone]` | zone 1=cpu 2=gpu (Custom only) |
-| Set CPU/GPU boost | `0x0d` | `0x07` | `0x03` | `[0x00,zone,level]` | requires Custom mode (rejected on fw1.3) |
+| Get CPU/GPU boost | `0x0d` | `0x87` | `0x03` | `[0x01,zone]` | zone 1=cpu 2=gpu; level in reply `args[2]` |
+| Set CPU/GPU boost | `0x0d` | `0x07` | `0x03` | `[0x01,zone,level]` | requires Custom mode (CPU 0-3, GPU 0-2) |
 | **Fan: enable manual** | `0x0d` | `0x02` | `0x04` | `[0x00,zone,mode,0x01]` | send for **both** zone `0x01` and `0x02` |
-| **Fan: set RPM** | `0x0d` | `0x01` | `0x03` | `[0x00,zone,rpm/100]` | per zone; after enabling manual |
+| **Fan: set RPM** | `0x0d` | `0x01` | `0x03` | `[0x01,zone,rpm/100]` | per zone, after enabling manual; `args[0]` must be `0x01` — with `0x00` the EC echoes the setpoint but won't settle there |
 | **Fan: auto** | `0x0d` | `0x02` | `0x04` | `[0x00,zone,mode,0x00]` | flag=0 on both zones |
 | Fan: setpoint readback | `0x0d` | `0x81` | `0x04` | `[0x00,0x01]` | commanded value, in reply `args[2]`*100 |
 | **Fan: tachometer** | `0x0d` | `0x88` | `0x04` | `[0x00,zone]` | measured RPM (`args[2]`*100); ramps ~40-50s |
