@@ -602,17 +602,21 @@ static int tui(int fd,const char*node){
             if(!nv_started){ nv_started=1; if(nv_init()!=0) snprintf(nverr,sizeof nverr,"NvAPI init failed (libnvidia-api.so?)"); ml_init(); }
             int liveV=NV.ok?nv_voltage_mv():-1, core=ml_core(), pw=ml_power(), gt=ml_temp();
             int pk=0,cnt=NV.ok?nv_uv_count(uv_mv,minf,&pk):0;
+            int root=(geteuid()==0);   // Max-freq cap (SetGpuLockedClocks) is root-only; undervolt is sudo-less
             printf("\033[H\033[1;36m  razerctl · dGPU undervolt\033[0m  [%s]   \033[1;90m◂ Esc: back\033[0m\033[K\n",NV.ok?NV.name:"no NvAPI");
             printf("  --------------------------------------------\n");
             if(NV.ok){
                 printf("   LIVE  core \033[1;33m%4dMHz\033[0m  volt \033[1;32m%dmV\033[0m  pwr \033[1;33m%dW\033[0m  temp \033[1;33m%dC\033[0m\033[K\n",
                     core<0?0:core, liveV<0?0:liveV, pw<0?0:pw, gt<0?0:gt);
             } else printf("   \033[1;31m%s\033[0m\033[K\n", nverr[0]?nverr:"NvAPI unavailable");
+            if(root) printf("   \033[1;32m● root\033[0m  \033[1;90mundervolt + max-freq cap both available\033[0m\033[K\n");
+            else     printf("   \033[1;33m● sudo-less\033[0m  \033[1;90mundervolt OK · Max-freq cap needs \033[0m\033[1;33msudo razerctl\033[0m\033[K\n");
             printf("  --------------------------------------------\n");
             printf("   \033[1mUNDERVOLT\033[0m  \033[1;90m↑↓ select  ←→ change  Enter: Apply/Reset\033[0m\n");
             ROWC(0,dsel==0,"Undervolt : \033[1;33m%-3d mV\033[0m  \033[1;90mcurve left-shift\033[0m",uv_mv);
             ROWC(1,dsel==1,"Min freq  : \033[1;33m%-5d MHz\033[0m \033[1;90mstock below\033[0m",minf);
-            ROWC(2,dsel==2,"Max freq  : \033[1;33m%-5s\033[0m \033[1;90mclock ceiling\033[0m",maxf?({static char mb[12];snprintf(mb,12,"%dMHz",maxf);mb;}):"off");
+            ROWC(2,dsel==2,"Max freq  : \033[1;33m%-5s\033[0m %s",maxf?({static char mb[12];snprintf(mb,12,"%dMHz",maxf);mb;}):"off",
+                 root?"\033[1;90mclock ceiling\033[0m":"\033[1;33mclock ceiling — needs sudo\033[0m");
             printf("  - - - - - - - - - - - - - - - - - - - - - - \n");
             ROWC(3,dsel==3,"\033[1;32m[ Apply ]\033[0m  \033[1;90m%d pts, peak +%dMHz\033[0m",cnt,pk);
             ROWC(4,dsel==4,"[ Reset ]  \033[1;90mback to stock curve\033[0m");
