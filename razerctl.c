@@ -25,9 +25,29 @@
 #include <sys/syscall.h>
 #include <linux/capability.h>
 #include <linux/hidraw.h>
+#include <sys/xattr.h>          // detect file-cap on the installed copy for the self-heal re-exec
 #ifndef CAP_SYS_ADMIN
 #define CAP_SYS_ADMIN 21
 #endif
+#define INSTALLED_BIN "/usr/local/bin/razerctl"
+// PATH often resolves `razerctl` to the uncapped build artifact in the repo dir
+// (caps drop on every rebuild and `make install` only caps the installed copy).
+// That binary starts with no cap_sys_admin in PERMITTED -> the dGPU clock write
+// fails -137. Self-heal: if we lack the cap but the installed copy has a file-cap
+// xattr, transparently re-exec it (once, guarded by RZ_REEXEC) so the user always
+// gets a working binary no matter which path they typed.
+static void maybe_reexec_capped(char**argv){
+    if(getenv("RZ_REEXEC")) return;                       // already handed off once
+    struct __user_cap_header_struct h={_LINUX_CAPABILITY_VERSION_3,0};
+    struct __user_cap_data_struct d[2]={{0,0,0},{0,0,0}};
+    if(syscall(SYS_capget,&h,d)==0 && (d[0].permitted&(1u<<CAP_SYS_ADMIN))) return; // we already have it
+    if(geteuid()==0) return;                              // root needs no cap
+    char self[4096]={0}; ssize_t sl=readlink("/proc/self/exe",self,sizeof self-1); if(sl>0)self[sl]=0;
+    if(!strcmp(self,INSTALLED_BIN)) return;               // we ARE the installed copy -> don't loop
+    if(getxattr(INSTALLED_BIN,"security.capability",NULL,0)<=0) return; // installed copy uncapped/missing
+    setenv("RZ_REEXEC","1",1);
+    execv(INSTALLED_BIN,argv);                            // hand off; on failure fall through and run as-is
+}
 // libnvidia-api.so exec's a privileged helper for clock writes; effective-only
 // file caps are lost across that exec, so the GPU write fails without sudo. Fix:
 // move cap_sys_admin (held in permitted via file-cap +epi) into INHERITABLE then
@@ -704,6 +724,7 @@ static int single_instance(void){
     close(fd); return 0;                                 // unexpected flock error -> don't block
 }
 int main(int argc,char**argv){
+    maybe_reexec_capped(argv);  // hand off to the installed capped copy if PATH gave us the uncapped build
     raise_ambient_sysadmin();   // sudo-less dGPU clock write (see helper above)
     // dGPU undervolt CLI (no EC/hidraw needed; NvAPI enumerates the GPU by device,
     // so it's immune to PCI-address changes across boots).
