@@ -1,128 +1,234 @@
-# razer-cli (`razerctl`)
+# razerctl — a tiny Razer Blade 16 control tool for Linux
 
-A tiny, dependency-free **C** tool to control a **Razer Blade 16** on Linux —
-fan, performance mode, and keyboard RGB — plus a live terminal power dashboard.
-It talks Razer's USB-HID vendor protocol directly over `hidraw` (no daemon, no libusb).
+`razerctl` is a small, dependency-free **C** program that lets you control a
+**Razer Blade 16** from the Linux terminal — fans, performance mode, keyboard
+backlight, battery charge limit, and even an **NVIDIA dGPU undervolt** — plus a
+live power dashboard. No daemon, no Python, no Synapse. It talks Razer's USB-HID
+protocol straight over `hidraw`.
 
-> ⚠️ **Unofficial.** Reverse-engineered protocol. Tested on a Razer Blade 16
-> (USB `1532:02b7`, firmware 1.3). Opcodes can differ across models/firmware —
-> use at your own risk, especially manual fan control.
-> I am 100% not liable if the custom fan curve leads to any thermal damage on your laptop!
+Think of it as a few hundred lines of C doing what Synapse does, minus the heavy
+GUI.
 
-## Features
-- **Perf mode** — Balanced / Gaming / Creator / Custom (verified against CPU package power); Custom unlocks CPU/GPU boost sub-levels
-- **Fan** — manual RPM (2000–4800), auto, or a temp-driven curve (`fancurve`)
-- **Battery charge limit** — set/disable (opcode from a Synapse USB capture)
-- **Keyboard** — solid-colour presets (white/red/purple/green) + off, brightness-locked
-- **TUI dashboard** — live fan RPM, battery draw, dGPU power state, CPU temp / package & core power, C-state residency; pausable polling
+> ⚠️ **Unofficial and reverse-engineered.** Built and tested on one machine: a
+> Razer Blade 16 (2024, USB `1532:02b7`) running CachyOS (Arch-based). Opcodes
+> differ across models and firmware, so treat this as a working example for *your*
+> Blade, not a guarantee. **Manual fan and GPU undervolt carry real risk — I am
+> not liable for thermal damage or instability. Use at your own risk.**
 
-## Installation
-See below. But rememver everything here is only tested on my own laptop (with CachyOS which is based on Arch). Due to the bleeding edge
-nature of Arch, it is possible some of these installation steps are wrong. Hence, this requires you to know a bit about linux and pick
-your own fix (usually very simple if you really search or just ask an AI).
+---
 
-### 1. Install the build tools
-You only need `git` and a C compiler (`gcc`). Pick your distro:
+## What it can do
+
+- **Performance mode** — Balanced / Gaming / Creator. On Linux the dGPU power
+  ceiling is actually governed by NVIDIA Dynamic Boost (`nvidia-powerd`), so the
+  modes pair with a Dynamic-Boost toggle: Creator parks the GPU at its ~80 W eco
+  floor, Balanced/Gaming let it boost.
+- **Fans** — fixed RPM (2000–4800), firmware auto, or a smart **temperature-driven
+  curve** that tracks CPU + dGPU temps.
+- **dGPU undervolt** *(RTX 40-series)* — a per-point voltage/frequency curve editor
+  (the same idea as MSI Afterburner's curve), with an optional max-frequency cap.
+  See [Undervolting the dGPU](#undervolting-the-dgpu).
+- **Keyboard backlight** — solid colour presets (white / red / purple / green) + off.
+- **Battery charge limit** — cap charging at 60/70/80 % to preserve battery health.
+- **CPU EPP** — energy-vs-performance bias (intel_pstate).
+- **Live dashboard** — fan RPM, battery draw, dGPU power state, CPU temp & power,
+  CPU busy %, all in a clean arrow-key TUI.
+
+---
+
+## Quick start
+
+You need `git` and a C compiler. That's it.
 
 ```sh
 # Arch / CachyOS / Manjaro
 sudo pacman -S --needed git base-devel
-
 # Ubuntu / Debian / Pop!_OS
 sudo apt update && sudo apt install -y git build-essential
-
 # Fedora
 sudo dnf install -y git gcc make
 ```
 
-### 2. Download and build
+Then build and install:
+
 ```sh
 git clone https://github.com/TimandXiyu/blade-cli.git
 cd blade-cli
 make
+sudo make install      # installs to /usr/local/bin and sets up sudo-less access
 ```
-This creates an executable called `razerctl` in the folder. If `make` isn't
-installed, run `gcc -O2 -o razerctl razerctl.c` instead.
 
-### 3. Try it (with sudo)
-`hidraw` (the device it talks to) is owned by root, so test with `sudo`:
+Try it:
+
 ```sh
-sudo ./razerctl get
+razerctl get           # prints your perf mode + fan setpoint
+razerctl               # no arguments → launches the dashboard
 ```
-If you see your perf mode + fan setpoint printed, it works. 🎉
 
-### 4. (Optional) Run without `sudo` every time
-Install a udev rule so your normal user can use it directly:
+If `razerctl get` prints your mode and fan setpoint, you're good. 🎉
+
+> **No `make install`?** You can run it straight from the folder with `sudo
+> ./razerctl get`. But `make install` is recommended — it puts `razerctl` on your
+> `PATH` and grants the one capability the dGPU undervolt needs (see below).
+
+### Running without `sudo`
+
+`make install` already sets things up so fans, perf mode, keyboard, and the dGPU
+**undervolt** all work without `sudo`. Under the hood it installs a udev rule so
+your user can talk to the Razer HID device, and gives the binary the
+`cap_sys_admin` capability the GPU clock write needs. If you ever want the udev
+rule by itself:
+
 ```sh
 sudo tee /etc/udev/rules.d/99-razerctl.rules >/dev/null <<'EOF'
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="02b7", MODE="0660", TAG+="uaccess"
 EOF
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
-Now `./razerctl get` works without `sudo`.
 
-### 5. (Optional) Run it from anywhere
-Copy the binary into your `PATH` so you can just type `razerctl`:
+The **one exception** is the dGPU **max-frequency cap**, which needs real root —
+see [Undervolting the dGPU](#undervolting-the-dgpu).
+
+---
+
+## The dashboard
+
+Run `razerctl` with no arguments. Navigation is all arrow keys — no hotkey
+cheat-sheet to memorise:
+
+- **↑ / ↓** — move between settings
+- **← / →** — change the selected setting
+- **Enter** — open a sub-page or toggle the selected item
+- **Esc** — go back (from the dGPU page to the main page)
+- **q** — quit
+
+The main page lets you set perf mode, fan mode (Auto / Manual / Curve), manual
+fan RPM, keyboard colour, CPU EPP, Dynamic Boost, and the battery charge limit.
+It also has a live readout up top (fan RPM, battery watts, dGPU state, CPU temp
+& power, CPU busy %), refreshed every few seconds so navigation stays snappy.
+
+Two rows open extra actions: **dGPU undervolt ▸** (Enter to open the undervolt
+page) and **Reclaim dGPU** (restart KWin to let an idle dGPU drop back to its
+near-0 W deep-sleep state after unplugging an external display).
+
+---
+
+## Undervolting the dGPU
+
+On the **dGPU undervolt** page you can shift the GPU's voltage/frequency curve to
+run cooler and quieter at the same clocks — like Afterburner's curve undervolt:
+
+- **Undervolt (mV)** — how far to shift the curve left (lower voltage for a given
+  clock). Start small, e.g. 30–50 mV.
+- **Min freq** — clocks below this stay at stock voltage (keeps idle stable).
+- **Max freq** — a hard clock ceiling, like a power slider. `off` = no cap.
+- **Apply** / **Reset** — apply your settings, or return the GPU to stock.
+
+**Sudo matters here.** The page shows a banner telling you which mode you're in:
+
+- 🟢 **root** (`sudo razerctl`) — undervolt **and** max-freq cap both work.
+- 🟡 **sudo-less** (plain `razerctl`) — undervolt works, but the **Max-freq cap
+  needs `sudo`**. The row is tagged accordingly and Apply will tell you if a cap
+  was skipped.
+
+So: **if you want to set a max-frequency cap, launch the tool with
+`sudo razerctl`.** If you only undervolt, plain `razerctl` is fine.
+
+From the command line:
+
 ```sh
-sudo install -m755 razerctl /usr/local/bin/
-razerctl            # launches the dashboard
+sudo razerctl uv 50 1000 2700   # -50 mV above 1000 MHz, capped at 2700 MHz
+razerctl uv 50 1000             # undervolt only (no cap) — works sudo-less
+sudo razerctl uv reset          # back to stock, clear the saved profile
+razerctl nvtest                 # read-only: dump the live curve + voltage
 ```
 
-### Troubleshooting
-- **`no responding 1532:02b7 hidraw`** — your Razer model/USB id differs. Run
-  `lsusb | grep 1532` to find yours; this tool targets `1532:02b7` (Blade 16).
-- **`Permission denied`** — use `sudo`, or do step 4.
-- **`gcc: command not found`** — redo step 1.
+**Persistence:** your undervolt is saved and re-applied automatically at login
+(sudo-less). The **max-freq cap is not** auto-restored on reboot, because it needs
+root — re-apply it with `sudo razerctl` each session if you want it.
 
-## Usage
-```sh
-razerctl get                              # show perf mode + fan setpoint
-razerctl rpm                              # live fan RPM, 2s interval
-razerctl mode balanced|gaming|creator|custom   # set performance mode
-razerctl boost                            # show CPU/GPU power sub-levels
-razerctl boost cpu high                   # set sub-level (Custom mode only)
-razerctl fan auto                         # return fan to firmware control
-razerctl fan 4000                         # manual RPM (clamped 2000-4800, Synapse range)
-razerctl fancurve                         # temp-driven auto fan (Ctrl-C restores auto)
-razerctl battery 80                       # battery charge limit (50-100, or off/status; see note below)
-razerctl kbd white|red|purple|green|off   # keyboard backlight
-razerctl                                  # no args -> TUI dashboard
-```
-TUI keys: `m` mode (cycles incl. Custom) · `1`-`4` set boost level (low/medium/high/boost) for the selected engine · `g` switch CPU/GPU boost target · `b` battery charge-limit cycle (off/60/70/80) · `f` fan auto/manual · `c` fan curve · `+`/`-` RPM ±500 · `k` kbd colour · `e` EPP · `d` dynboost (nvidia-powerd) · `w` reclaim · `p` pause monitor · `r` refresh · `q` quit.
+> ⚠️ If your panel is driven by the dGPU (BIOS dGPU-only / MUX mode), an unstable
+> curve can crash the display (recoverable). Tune gently: apply a modest offset,
+> confirm it holds under load, then push further. `Reset` returns to stock.
 
-In **Custom** mode the dashboard shows both engines' boost levels plus a legend (`1=low 2=medium 3=high 4=boost`) and which engine `1`-`4` currently edit; `g` flips between CPU and GPU. GPU has no `boost` level, so `4` is hidden when editing it.
+---
 
-> Note: the fan tachometer reading ramps slowly (~40–50 s to settle after a change).
-> Note: the fan speed is partially controlled by the EC firmware, you might see the fan speed deviating from what you set. I don't have an solution to this and, honestly, it is probably a good EC firmware level safeguard to prebent from F-up your fan curve and burn your laptop.
+## Command-line reference
+
+| Command | What it does |
+|---|---|
+| `razerctl` | launch the TUI dashboard |
+| `razerctl get` | print perf mode + fan setpoint + EPP |
+| `razerctl mode <balanced\|gaming\|creator>` | set performance mode |
+| `razerctl fan auto` | hand the fans back to firmware |
+| `razerctl fan <2000-4800>` | set a fixed fan RPM |
+| `razerctl fancurve` | temperature-driven auto fan (Ctrl-C restores auto) |
+| `razerctl rpm` | live fan RPM, 2 s interval |
+| `razerctl battery <50-100\|off\|status>` | battery charge limit (see note) |
+| `razerctl kbd <white\|red\|purple\|green\|off>` | keyboard backlight |
+| `razerctl epp [0-255]` | show or set CPU energy-vs-performance bias (0 = max perf) |
+| `razerctl powerd <on\|off\|status>` | toggle NVIDIA Dynamic Boost (`nvidia-powerd`) |
+| `razerctl power <max\|save\|status>` | `max` = boost on (≤175 W) · `save` = boost off |
+| `razerctl reclaim` | restart KWin to release an idle dGPU → back to deep sleep |
+| `razerctl uv <mV> <min> [max]` | apply a dGPU undervolt (max-freq cap needs sudo) |
+| `razerctl uv reset` | reset the dGPU to stock + clear the saved profile |
+| `razerctl nvtest` | read-only dGPU curve / voltage diagnostic |
+
+**Notes:**
+- The fan **tachometer ramps slowly** (~40–50 s to settle after a change) — that's
+  the sensor, not a bug.
+- The EC firmware has the final say on fan speed, so you may see it deviate from
+  what you set. That's a built-in safety net; leave it be.
+- Battery limit **can't be read back as a percentage** (the firmware only returns a
+  status byte), so confirm it behaviourally — charging should stop near the limit.
+- `epp` is reset by **TLP** on every AC↔battery switch.
+
+---
 
 ## How it works
-Razer routes fan/perf/RGB control through 90-byte USB-HID feature reports
-(the openrazer report format) to the keyboard MCU — **not** the ACPI EC. This
-tool builds those reports and sends them via `HIDIOCSFEATURE`/`HIDIOCGFEATURE`.
+
+Razer routes fan / perf / RGB control through 90-byte USB-HID feature reports
+(the openrazer format) to the keyboard MCU — **not** the ACPI EC. `razerctl`
+builds those reports and sends them via `HIDIOCSFEATURE` / `HIDIOCGFEATURE`. The
+dGPU undervolt is separate: it drives NVIDIA's undocumented NvAPI through
+`libnvidia-api.so` (the same interface Afterburner uses on Windows) to read and
+rewrite the per-point clock table, with NVML for clock/power/temperature
+readouts and the optional locked-clock cap.
+
+---
 
 ## Acknowledgements
+
 Protocol knowledge derived from **Ashcon Mohseninia (rnd-ash)** and the
-[`razer-laptop-control`](https://github.com/rnd-ash/razer-laptop-control)
-project — huge thanks for the original reverse-engineering of Razer's laptop
-fan/power protocol. Also thanks to the [openrazer](https://github.com/openrazer/openrazer)
-project for the base report format, and to [`tdakhran/razer-ctl`](https://github.com/tdakhran/razer-ctl)
-for Blade 16 reference.
+[`razer-laptop-control`](https://github.com/rnd-ash/razer-laptop-control) project —
+huge thanks for the original reverse-engineering of Razer's laptop fan/power
+protocol. Thanks also to [openrazer](https://github.com/openrazer/openrazer) for
+the base report format, [`tdakhran/razer-ctl`](https://github.com/tdakhran/razer-ctl)
+for Blade 16 reference, and the **nvcurve** project for the NvAPI clock-table
+offsets used by the undervolt.
 
 ## License
-GPL-2.0 — see [LICENSE](LICENSE). Chosen to match `razer-laptop-control`,
-from whose GPL-2.0 source the protocol details were learned.
+
+GPL-2.0 — see [LICENSE](LICENSE). Chosen to match `razer-laptop-control`, from
+whose GPL-2.0 source the protocol details were learned.
+
+---
 
 ## Protocol reference (for forking / extending)
-I highly recommend you sniff your blade-specific opcode, it is merely some bytes usually sent by the Synapse to control the EC firmware. Hence, this is also why you only need a very small c program to emulate whatever Synapse is doing without all the fuss about Synapse's very heavy and ugly frontend. Since recent generations are often undergoing big changes, for example, intel and amd based blades are almost guaranteed to have a different opcode set... hence, this repo is more of a guideline to teach you how to reserse engineer and create your own version of the razerctl. Additionally, if you'd like to, you can raise a PR once you figure out your own razerctl so I can merge your PR.
 
-Unknown opcode? Don't guess writes — sniff what Synapse sends on Windows and port it:
-the full workflow (Wireshark + USBPcap capture, decode, on-device verification) is in
-[SKILL.md](SKILL.md), with the segment-capture driver script at [`sniff/capture.ps1`](sniff/capture.ps1).
+Your Blade probably speaks slightly different opcodes — especially across Intel
+vs AMD generations. Treat this repo as a **guide to reverse-engineering your own**
+rather than a drop-in. The reliable approach: sniff what Synapse sends on Windows
+and port it. The full workflow (Wireshark + USBPcap capture, decode, on-device
+verification) is in [SKILL.md](SKILL.md), with the capture script at
+[`sniff/capture.ps1`](sniff/capture.ps1). If you get your variant working, PRs
+are welcome.
 
-All ops are a 90-byte report sent via `HIDIOCSFEATURE` (then `HIDIOCGFEATURE` to read the reply).
-Framing: `byte0`=report id `0x00`, `byte1`=status, `byte2`=transaction id **`0x1f`**, `byte5`=data_size,
-`byte6`=command class, `byte7`=command id, `byte8..`=args, `byte89`=CRC (`XOR` of bytes `2..87`).
-Reply **status byte**: `0x02`=OK, `0x05`=not-supported, `0x01`=busy, `0x03`=fail.
+All ops are a 90-byte report sent via `HIDIOCSFEATURE` (then `HIDIOCGFEATURE` to
+read the reply). Framing: `byte0` = report id `0x00`, `byte1` = status,
+`byte2` = transaction id **`0x1f`**, `byte5` = data_size, `byte6` = command class,
+`byte7` = command id, `byte8..` = args, `byte89` = CRC (`XOR` of bytes `2..87`).
+Reply **status byte**: `0x02` = OK, `0x05` = not-supported, `0x01` = busy, `0x03` = fail.
 
 | Operation | class | cmd | data_size | args `[a0,a1,...]` | Notes |
 |---|---|---|---|---|---|
@@ -131,7 +237,7 @@ Reply **status byte**: `0x02`=OK, `0x05`=not-supported, `0x01`=busy, `0x03`=fail
 | **Get perf mode** | `0x0d` | `0x82` | `0x04` | `[0x00,0x01]` | mode in reply `args[2]`; 0=Bal 1=Gaming 2=Creator |
 | **Set perf mode** | `0x0d` | `0x02` | `0x04` | `[0x00,0x01,mode,fanflag]` | mode in **args[2]**; `fanflag`=1 if manual fan active |
 | Get CPU/GPU boost | `0x0d` | `0x87` | `0x03` | `[0x01,zone]` | zone 1=cpu 2=gpu; level in reply `args[2]` |
-| Set CPU/GPU boost | `0x0d` | `0x07` | `0x03` | `[0x01,zone,level]` | requires Custom mode (CPU 0-3, GPU 0-2) |
+| Set CPU/GPU boost | `0x0d` | `0x07` | `0x03` | `[0x01,zone,level]` | the old "Custom mode" levers; retired from the UI but the opcodes still work |
 | **Fan: enable manual** | `0x0d` | `0x02` | `0x04` | `[0x00,zone,mode,0x01]` | send for **both** zone `0x01` and `0x02` |
 | **Fan: set RPM** | `0x0d` | `0x01` | `0x03` | `[0x01,zone,rpm/100]` | per zone, after enabling manual; `args[0]` must be `0x01` — with `0x00` the EC echoes the setpoint but won't settle there |
 | **Fan: auto** | `0x0d` | `0x02` | `0x04` | `[0x00,zone,mode,0x00]` | flag=0 on both zones |
@@ -149,25 +255,7 @@ CRC reference (C):
 unsigned char crc=0; for (int i=2;i<88;i++) crc ^= report[1+i];  // report[1] = struct byte 0
 ```
 
-Control hidraw nodes for this device: `/dev/hidraw3..6` (any that answers Get-firmware works).
-
-## razerctl command chart
-| Command | Action |
-|---|---|
-| `razerctl get` | print perf mode + fan setpoint + EPP |
-| `razerctl epp` | show CPU energy-vs-performance bias (intel_pstate HWP, raw 0-255) + preset list |
-| `razerctl epp <0-255>` | set EPP (0=max perf … 255=max power-save). **TLP resets it on the next AC↔DC switch** (`CPU_ENERGY_PERF_POLICY_ON_AC/BAT`). TUI: `e` cycles presets 0/32/…/224/255. Sudo-less via `/etc/tmpfiles.d/epp-write.conf` (0666 on `energy_performance_preference`) |
-| `razerctl rpm` | live fan RPM (2s loop) |
-| `razerctl mode <balanced\|gaming\|creator\|custom>` | set perf mode. **Custom** (mode 4) unlocks the CPU/GPU boost sub-levels |
-| `razerctl boost` | show current CPU + GPU power sub-levels |
-| `razerctl boost <cpu\|gpu> <low\|medium\|high\|boost\|0-3>` | set a sub-level (CPU 0-3, GPU 0-2). Only takes effect in **Custom** mode |
-| `razerctl fan auto` | hand fan back to firmware |
-| `razerctl fan <2000-4800>` | manual fan RPM (Synapse's rated range; was 2500-5300 — the old `args[0]=0x00` made the EC accept but not settle at the setpoint, fixed to `0x01` per USB capture) |
-| `razerctl fancurve` | temp-driven auto fan: rpm follows CPU + dGPU temps via EMA-smoothed two-segment curves (flat floor → engage step → ramp to max at an alarm temp); the shared fans take the louder demand. dGPU temp is read (`nvidia-smi`) only when the GPU is already awake. `Ctrl-C` restores auto. Also a TUI toggle (`c`). Curve thresholds are `#define`s at the top of `razerctl.c`. |
-| `razerctl battery <50-100\|off\|status>` | set / disable / read the EC charge limit. Setter = `0x07/0x12`, arg `pct\|0x80` (well-attested from the Synapse capture). **Caveat: no readback can confirm the stored %** — `0x07/0x8f` returns a status byte, not the percentage — so verify behaviorally (charging stops near the limit). TUI: `b` cycles off/60/70/80 |
-| `razerctl kbd <white\|red\|purple\|green\|off>` | keyboard backlight |
-| `razerctl powerd <on\|off\|status>` | toggle NVIDIA `nvidia-powerd` (Dynamic Boost) at runtime (start/stop); `off` lets the dGPU reach D3cold (~0W). Sudo-less via polkit `49-nvidia-powerd.rules` (wheel may start/stop that unit). Non-persistent — reboot returns to off |
-| `razerctl power <max\|save\|status>` | `max`=start powerd (boost ≤175 W) · `save`=stop powerd (ceiling resets on next D3cold) · `status`=show powerd + power limits. Sudo-less (same polkit rule) |
-| `razerctl reclaim` | restart KWin to release the dGPU after undocking (KWin auto-grabs it for an external but never frees it) → returns to D3cold. Brief screen flicker. |
-| `razerctl` | launch TUI dashboard |
-
+Control hidraw nodes for this device: `/dev/hidraw3..6` (any that answers
+Get-firmware works). The dGPU undervolt path is independent of hidraw — it goes
+through `libnvidia-api.so` / NVML and finds the GPU by device, so it survives PCI
+address changes and degrades gracefully on an iGPU-only boot.
