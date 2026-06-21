@@ -493,7 +493,13 @@ static int ml_init(void){
 static int ml_core(void){ unsigned v=0; return (ML.ok&&ML.clk&&ML.clk(ML.h,0,&v)==0)?(int)v:-1; }   // NVML_CLOCK_GRAPHICS=0
 static int ml_power(void){ unsigned v=0; return (ML.ok&&ML.pw&&ML.pw(ML.h,&v)==0)?(int)(v/1000):-1; }
 static int ml_temp(void){ unsigned v=0; return (ML.ok&&ML.tp&&ML.tp(ML.h,0,&v)==0)?(int)v:-1; }     // NVML_TEMPERATURE_GPU=0
-static void nv_lock_max(int maxf){ if(maxf>0&&ML.ok){ int(*lk)(void*,unsigned,unsigned)=(int(*)(void*,unsigned,unsigned))dlsym(ML.lib,"nvmlDeviceSetGpuLockedClocks"); if(lk) lk(ML.h,210,maxf); } }
+// nvmlDeviceSetGpuLockedClocks/ResetGpuLockedClocks are privileged NVML calls that
+// require REAL ROOT (euid 0) -- unlike the NvAPI curve write, cap_sys_admin is NOT
+// enough, the call just returns NO_PERMISSION. Return the NVML rc so callers can
+// surface that (0=ok). maxf<=0 means "no cap" -> caller should nv_unlock() instead.
+static int nv_lock_max(int maxf){ if(maxf>0&&ML.ok){ int(*lk)(void*,unsigned,unsigned)=(int(*)(void*,unsigned,unsigned))dlsym(ML.lib,"nvmlDeviceSetGpuLockedClocks"); if(lk) return lk(ML.h,210,maxf); } return -1; }
+// Release any locked-clock clamp (also root-only). Safe no-op if NVML unavailable.
+static int nv_unlock(void){ if(ML.ok){ int(*ul)(void*)=(int(*)(void*))dlsym(ML.lib,"nvmlDeviceResetGpuLockedClocks"); if(ul) return ul(ML.h); } return -1; }
 
 // "on" = nvidia-powerd ACTIVE this boot. We toggle via start/stop (runtime, polkit-scoped to the unit),
 // NOT enable/disable, so it's intentionally non-persistent: a reboot returns to powerd OFF (D3cold default).
@@ -688,16 +694,19 @@ static int tui(int fd,const char*node){
                 else if(dsel==3){ int r2=nv_write_uv(uv_mv,minf);
                     if(r2!=0) snprintf(msg,sizeof msg,"curve write FAILED (nvapi %d)",r2);
                     else { nv_applied=1; int pk,c=nv_uv_count(uv_mv,minf,&pk);
-                        nv_lock_max(maxf); uv_save(uv_mv,minf,maxf);
-                        snprintf(msg,sizeof msg,"APPLIED -%dmV >%dMHz (%d pts,+%dMHz) - saved, persists at login",uv_mv,minf,c,pk); } }
-                else if(dsel==4){ nv_reset();
-                    if(ML.ok){ int(*ul)(void*)=(int(*)(void*))dlsym(ML.lib,"nvmlDeviceResetGpuLockedClocks"); if(ul) ul(ML.h); }
+                        int lr = maxf>0 ? nv_lock_max(maxf) : nv_unlock();   // off -> actively release any lock
+                        uv_save(uv_mv,minf,maxf);
+                        if(maxf>0 && lr!=0)   // SetGpuLockedClocks is root-only; cap_sys_admin isn't enough
+                            snprintf(msg,sizeof msg,"UV applied; max-freq cap NEEDS sudo (nvml %d) - run: sudo razerctl",lr);
+                        else
+                            snprintf(msg,sizeof msg,"APPLIED -%dmV >%dMHz (%d pts,+%dMHz)%s - saved",uv_mv,minf,c,pk,maxf>0?", capped":""); } }
+                else if(dsel==4){ nv_reset(); int ur=nv_unlock();
                     nv_applied=0; uv_mv=0; maxf=0; { char p[300]; uv_path(p,sizeof p); unlink(p); }
-                    snprintf(msg,sizeof msg,"reset to stock curve (profile cleared)"); }
+                    snprintf(msg,sizeof msg, ur==0?"reset to stock (curve + clocks unlocked)":"curve reset; clock-unlock needs sudo (nvml %d)",ur); }
             }
         }
     }
-    if(NV.ok) nv_reset();   // leave the GPU at stock on exit (curve resets on reboot anyway)
+    if(NV.ok){ nv_reset(); nv_unlock(); }   // leave the GPU at stock on exit (curve + clock clamp; both reset on reboot anyway)
     raw_off(); return 0;
 }
 // Single-instance guard. Two razerctl processes doing interleaved hidraw feature-reports
@@ -731,20 +740,26 @@ int main(int argc,char**argv){
     if(argc>=2 && !strcmp(argv[1],"--uv-apply")){           // headless re-apply (systemd unit)
         int mv,minf,maxf; if(uv_load(&mv,&minf,&maxf)!=0){ printf("no undervolt profile\n"); return 0; }
         if(nv_init()!=0){ printf("dGPU absent (iGPU-only boot?) - undervolt skipped\n"); return 0; }  // graceful no-op
-        int r=nv_write_uv(mv,minf); if(maxf>0){ ml_init(); nv_lock_max(maxf); }
-        printf("uv-apply: -%dmV >%dMHz%s -> %s\n",mv,minf, maxf?" capped":"", r==0?"ok":"FAILED");
+        int r=nv_write_uv(mv,minf); int lr=0;
+        if(maxf>0){ ml_init(); lr=nv_lock_max(maxf); }   // root-only; login service runs as user so this no-ops
+        printf("uv-apply: -%dmV >%dMHz%s -> %s%s\n",mv,minf, maxf?" capped":"", r==0?"ok":"FAILED",
+            (maxf>0&&lr!=0)?" (max-freq cap skipped: needs root)":"");
         return r==0?0:1;
     }
     if(argc>=2 && !strcmp(argv[1],"uv")){                   // razerctl uv <mv> <minf> [maxf] | reset
         if(nv_init()!=0){ fprintf(stderr,"NvAPI unavailable (libnvidia-api.so?)\n"); return 1; }
-        if(argc>=3 && !strcmp(argv[2],"reset")){ nv_reset(); char p[300]; uv_path(p,sizeof p); unlink(p); printf("reset to stock, profile cleared\n"); return 0; }
+        if(argc>=3 && !strcmp(argv[2],"reset")){ nv_reset(); ml_init(); int ur=nv_unlock();
+            char p[300]; uv_path(p,sizeof p); unlink(p);
+            printf("reset to stock, profile cleared%s\n", ur==0?" (clocks unlocked)":" (clock-unlock needs root: sudo razerctl uv reset)");
+            return 0; }
         if(argc<4){ fprintf(stderr,"usage: razerctl uv <mV> <min_freq_MHz> [max_freq_MHz]\n       razerctl uv reset\n"); return 1; }
         int mv=atoi(argv[2]),minf=atoi(argv[3]),maxf=argc>4?atoi(argv[4]):0;
         int r=nv_write_uv(mv,minf);
         if(r!=0){ fprintf(stderr,"curve write FAILED (nvapi %d) - need cap_sys_admin or sudo\n",r); return 1; }
-        if(maxf>0){ ml_init(); nv_lock_max(maxf); }
+        int lr=0; if(maxf>0){ ml_init(); lr=nv_lock_max(maxf); } else { ml_init(); nv_unlock(); }
         uv_save(mv,minf,maxf); int pk,c=nv_uv_count(mv,minf,&pk);
-        printf("applied -%dmV >%dMHz (%d pts, +%dMHz)%s; profile saved (persists at login)\n",mv,minf,c,pk,maxf?", capped":"");
+        if(maxf>0 && lr!=0) fprintf(stderr,"WARNING: max-freq cap NOT applied (nvml %d) - SetGpuLockedClocks needs root: sudo razerctl uv %d %d %d\n",lr,mv,minf,maxf);
+        printf("applied -%dmV >%dMHz (%d pts, +%dMHz)%s; profile saved (persists at login)\n",mv,minf,c,pk,(maxf&&lr==0)?", capped":"");
         return 0;
     }
     if(single_instance()<0) return 3;
