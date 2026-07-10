@@ -111,7 +111,7 @@ static int kbd_color(int fd,int r,int g,int b){
     return 0;
 }
 static const struct { const char*name; int r,g,b; } KBD[] = {
-    {"off",-1,-1,-1}, {"white",255,255,255}, {"red",255,0,0}, {"purple",128,0,128}, {"green",0,255,0}
+    {"off",-1,-1,-1}, {"white",255,255,255}, {"red",255,0,0}, {"purple",128,0,128}, {"green",102,185,51}
 };
 #define NKBD ((int)(sizeof KBD / sizeof KBD[0]))
 

@@ -60,7 +60,7 @@ static int set_charge_limit(int fd,int raw){ (void)fd; char c[48];
 // Defined before kbd_color() below since it needs to map an (r,g,b) triplet back to
 // razerctld's KBD index (the daemon owns the same table; this just has to agree with it).
 static const struct { const char*name; int r,g,b; } KBD[] = {
-    {"off",-1,-1,-1}, {"white",255,255,255}, {"red",255,0,0}, {"purple",128,0,128}, {"green",0,255,0}
+    {"off",-1,-1,-1}, {"white",255,255,255}, {"red",255,0,0}, {"purple",128,0,128}, {"green",102,185,51}
 };
 #define NKBD ((int)(sizeof KBD / sizeof KBD[0]))
 static int kbd_off(int fd){ (void)fd; return rpc_ok("KBD 0"); }
