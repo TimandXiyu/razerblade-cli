@@ -1,0 +1,13 @@
+#!/bin/bash
+# Post-resume hook: the Razer EC resets volatile state (kbd RGB backlight, sometimes
+# the fan) across S3 on its own, independent of hidraw staying connected -- so
+# razerctld's own reconnect-detection (which only fires on a broken hidraw fd) never
+# catches it. Kick it via SIGHUP to force an immediate full re-apply of persisted
+# state right after resume, instead of waiting up to REASSERT_S (5min).
+[ "$1" = "post" ] || exit 0
+case "$2" in
+  hibernate|suspend|hybrid-sleep|suspend-then-hibernate) ;;
+  *) exit 0 ;;
+esac
+systemctl kill -s HUP razerctld 2>/dev/null || true
+exit 0

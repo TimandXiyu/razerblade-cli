@@ -231,6 +231,7 @@ static void bg_tick(int fd){
         last_reassert=now;
         if(get_pmode(fd)!=st.mode) set_pmode(fd,st.mode,st.fanmode==1);
         apply_battery(fd);   // no readback exists for this one -- just re-send it
+        apply_kbd(fd);       // ditto -- the EC has no "read back current RGB" either
     }
 }
 
@@ -289,10 +290,17 @@ static void handle_client(int fd,int cfd){
 
 static volatile sig_atomic_t stop=0;
 static void on_term(int s){ (void)s; stop=1; }
+// The EC resets volatile state (kbd RGB, occasionally the fan) across S3 on its own,
+// independent of hidraw staying connected -- so the reconnect-on-broken-fd path below
+// never catches it (get_pmode still succeeds fine post-resume). A system-sleep hook
+// (see /usr/lib/systemd/system-sleep/zz-razerctld-resume) sends SIGHUP right after
+// resume to force an immediate full re-apply instead of waiting up to REASSERT_S.
+static volatile sig_atomic_t reapply=0;
+static void on_hup(int s){ (void)s; reapply=1; }
 
 int main(void){
     if(geteuid()!=0){ fprintf(stderr,"razerctld needs root (run via systemd, not by hand)\n"); return 1; }
-    signal(SIGTERM,on_term); signal(SIGINT,on_term); signal(SIGPIPE,SIG_IGN);
+    signal(SIGTERM,on_term); signal(SIGINT,on_term); signal(SIGPIPE,SIG_IGN); signal(SIGHUP,on_hup);
     state_load();
 
     char node[64]="?"; int fd=-1;
@@ -321,6 +329,10 @@ int main(void){
         if(rv>0 && FD_ISSET(lfd,&r)){
             int cfd=accept(lfd,NULL,NULL);
             if(cfd>=0){ handle_client(fd,cfd); close(cfd); }
+        }
+        if(reapply){   // SIGHUP from the system-sleep hook: EC state (esp. kbd RGB) resets across S3
+            reapply=0;
+            if(fd>=0){ apply_all(fd); fprintf(stderr,"razerctld: reapplied full state after resume (SIGHUP)\n"); }
         }
         if(fd<0 || get_pmode(fd)<0){    // hidraw re-enumerates on suspend/resume -- reconnect + reapply
             if(fd>=0) close(fd);
