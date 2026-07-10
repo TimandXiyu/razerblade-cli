@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// razer-cli - Razer Blade 16 control over hidraw.
-// Protocol derived from rnd-ash/razer-laptop-control (Ashcon Mohseninia), GPL-2.0.
-// razerctl - Razer Blade 16 (1532:02b7) fan/perf control via hidraw.
-// Protocol verified against rnd-ash/razer-laptop-control driver + by-ear test.
-// Manual fan REQUIRES: power-mode cmd (0x0d/0x02) with manual flag (arg3=1),
-// applied to BOTH fan zones (arg1=0x01 and 0x02), then rpm cmd (0x0d/0x01).
+// razerctl - CLIENT for the Razer Blade 16 (1532:02b7) control daemon (razerctld).
+// All hidraw/EC access (fan, perf mode, keyboard backlight, battery charge limit,
+// the temp-driven fan curve) lives in razerctld now, which owns the device and
+// persists+enforces that state across boots. This binary is a thin RPC client over
+// a local UNIX socket (razer_ipc.h) -- no root needed for any of that. The dGPU
+// undervolt page is the one exception: it talks to NvAPI/NVML directly (unrelated
+// to the EC/hidraw), stays in this client, and still needs root to WRITE (reads work
+// unprivileged). See razerctld.c for the actual hidraw protocol.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,138 +14,60 @@
 #include <unistd.h>
 #include <termios.h>
 #include <sys/select.h>
-#include <signal.h>
 #include <time.h>
-#include <sys/ioctl.h>
-#include <sys/file.h>           // flock (single-instance guard)
-#include <errno.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <dlfcn.h>              // dlopen libnvidia-api.so / libnvidia-ml.so (dGPU undervolt page)
 #include <stdint.h>
 #include <dirent.h>             // dGPU PCI auto-discovery (address can change across boots)
 #include <sys/stat.h>          // mkdir for the undervolt profile
-#include <linux/hidraw.h>
-#define L 91                    // Razer HID feature-report length, in bytes
-static unsigned char TID=0x1f;
-// Razer HID feature report layout (L bytes):
-//   [0]=report-id(0)  [2]=transaction-id(TID)  [6]=data-size  [7]=command-class
-//   [8]=command-id    [9..]=args               [89]=CRC (xor of bytes 3..88)
-// Command class/id pairs used below:
-//   0x0d/0x02 set power-mode/fan-enable   0x0d/0x01 set fan rpm
-//   0x0d/0x82 get power-mode   0x0d/0x81 get fan setpoint   0x0d/0x88 get fan tach
-//   0x03/0x03 kbd brightness   0x03/0x0b kbd row colors     0x03/0x0a kbd commit
-static void build(unsigned char*b,unsigned char cls,unsigned char cmd,unsigned char ds,const unsigned char*a,int n){
-    memset(b,0,L); b[2]=TID; b[6]=ds; b[7]=cls; b[8]=cmd;
-    for(int i=0;i<n;i++) b[9+i]=a[i];
-    unsigned char c=0; for(int i=2;i<88;i++) c^=b[1+i]; b[89]=c;
+#include "razer_ipc.h"
+// ---- RPC to razerctld: one line request -> one line "OK ..."/"ERR ..." response ----
+static int rpc(const char*cmd,char*resp,int rn){
+    int s=socket(AF_UNIX,SOCK_STREAM,0); if(s<0) return -1;
+    struct sockaddr_un a; memset(&a,0,sizeof a); a.sun_family=AF_UNIX;
+    strncpy(a.sun_path,RAZERCTLD_SOCK,sizeof(a.sun_path)-1);
+    if(connect(s,(struct sockaddr*)&a,sizeof a)<0){ close(s); return -1; }
+    char line[256]; int ln=snprintf(line,sizeof line,"%s\n",cmd);
+    if(write(s,line,ln)!=ln){ close(s); return -1; }
+    int n=read(s,resp,rn-1); close(s);
+    if(n<=0) return -1;
+    resp[n]=0; char*nl=strpbrk(resp,"\r\n"); if(nl)*nl=0;
+    return strncmp(resp,"OK",2)==0?0:-1;
 }
-static int xfer(int fd,unsigned char*b,unsigned char*in){
-    if(ioctl(fd,HIDIOCSFEATURE(L),b)<0) return -1; usleep(60000);
-    unsigned char tmp[L]; if(!in)in=tmp; memset(in,0,L); in[0]=0;
-    if(ioctl(fd,HIDIOCGFEATURE(L),in)<0) return -2; return in[1];
-}
-static int snd(int fd,unsigned char cls,unsigned char cmd,unsigned char ds,const unsigned char*a,int n){
-    unsigned char b[L]; build(b,cls,cmd,ds,a,n); return xfer(fd,b,NULL);
-}
-static int open_dev(char*chosen){
-    for(int n=0;n<32;n++){ char p[64]; snprintf(p,sizeof p,"/dev/hidraw%d",n);
-        int fd=open(p,O_RDWR); if(fd<0) continue;
-        struct hidraw_devinfo di;
-        if(ioctl(fd,HIDIOCGRAWINFO,&di)==0 && di.vendor==0x1532 && di.product==0x02b7){
-            unsigned char b[L],in[L],z=0; build(b,0x00,0x81,0x02,&z,0);
-            if(xfer(fd,b,in)==0x02){ if(chosen)strcpy(chosen,p); return fd; } }
-        close(fd);
-    }
-    return -1;
-}
-// ---- reads ----
-static int get_pmode(int fd){ unsigned char b[L],in[L],a[2]={0,1};
-    build(b,0x0d,0x82,0x04,a,2); if(xfer(fd,b,in)!=0x02) return -1; return in[11]; }
-static int get_fan_setpoint(int fd){ unsigned char b[L],in[L],a[2]={0,1};
-    build(b,0x0d,0x81,0x04,a,2); if(xfer(fd,b,in)!=0x02) return -1; return in[11]*100; }
-static int get_tach(int fd,int zone){ // 0x88 real tach (ramps ~40-50s; encoded /100)
-    unsigned char b[L],in[L],a[2]={0,(unsigned char)zone};
-    build(b,0x0d,0x88,0x04,a,2); if(xfer(fd,b,in)!=0x02) return -1; return in[11]*100;
-}
-// ---- writes ----
-static int set_fan(int fd,int rpm){           // verified working sequence
-    int sp=rpm/100; int m=get_pmode(fd); if(m<0||m>=4) m=0;
-    // rpm write args[0] must be 0x01 (Synapse USB capture 2026-06-12); 0x00 made the
-    // EC take the setpoint but not reliably settle the fan at it
-    unsigned char z1e[4]={0,1,(unsigned char)m,1}, z1r[3]={1,1,(unsigned char)sp};
-    unsigned char z2e[4]={0,2,(unsigned char)m,1}, z2r[3]={1,2,(unsigned char)sp};
-    snd(fd,0x0d,0x82,0x04,(unsigned char[]){0,1,0,0},4); // get pwr
-    int ok=0;
-    ok|=snd(fd,0x0d,0x02,0x04,z1e,4)!=0x02;             // enable manual z1
-    ok|=snd(fd,0x0d,0x01,0x03,z1r,3)!=0x02;             // rpm z1
-    ok|=snd(fd,0x0d,0x02,0x04,z2e,4)!=0x02;             // enable manual z2
-    ok|=snd(fd,0x0d,0x01,0x03,z2r,3)!=0x02;             // rpm z2
-    return ok?-1:0;
-}
-static int set_fan_auto(int fd){
-    int m=get_pmode(fd); if(m<0||m>=4) m=0;
-    unsigned char z1[4]={0,1,(unsigned char)m,0}, z2[4]={0,2,(unsigned char)m,0};
-    int ok=0; ok|=snd(fd,0x0d,0x02,0x04,z1,4)!=0x02; ok|=snd(fd,0x0d,0x02,0x04,z2,4)!=0x02;
-    return ok?-1:0;
-}
-static int set_pmode(int fd,int mode,int force_manual){ // 0=balanced 1=gaming 2=creator. EC perf-mode 0x0d/0x02 to BOTH zones.
-    if(mode<0||mode>2) return -1;                   // Custom (4) removed 2026-06-19 (unreliable, no GPU-TDP effect).
-    // force_manual must come from real fan-mode STATE (caller-tracked), never from get_fan_setpoint(fd)>0 --
-    // that register is the EC's currently-ACTIVE target, which reads nonzero any time the fan is spun up for
-    // ANY reason (auto/curve thermal response included), not just true manual mode. Using it here was the bug
-    // (found 2026-07-07): switching to Creator while the fan was already spun up (warm from Gaming/Balanced)
-    // mistook that for "manual" and re-asserted manual-enable at the stale elevated rpm, pinning the fan loud
-    // right when Creator should let it settle down quiet -- the opposite of Windows' "Silent" behavior.
-    unsigned char flag = force_manual?1:0;
-    unsigned char z1[4]={1,1,(unsigned char)mode,flag}, z2[4]={1,2,(unsigned char)mode,flag};
-    int ok=0; ok|=snd(fd,0x0d,0x02,0x04,z1,4)!=0x02; ok|=snd(fd,0x0d,0x02,0x04,z2,4)!=0x02;
-    if(ok) return -1;
-    if(get_pmode(fd)!=mode) return -2;
-    // GPU TDP on Linux is governed by Dynamic Boost (nvidia-powerd), NOT the EC perf-mode: powerd OFF caps the
-    // dGPU at its ~80W default; ON lets the driver boost to ~175W. (nvidia-smi -pl is ignored/clamped on this Ada
-    // laptop -- verified 2026-06-19.) So Creator parks the GPU at the 80W eco floor; Balanced/Gaming enable boost
-    // and the EC mode then differentiates them (~118W vs ~165W under load). sudo-less via polkit (same as 'd' key).
-    system(mode==2 ? "/usr/bin/systemctl stop nvidia-powerd 2>/dev/null"
-                   : "/usr/bin/systemctl start nvidia-powerd 2>/dev/null");
-    // Creator also steps down PCIe ASPM to its deepest link-power-saving state (added 2026-07-07, user request:
-    // "flip the power management levers such as pcie stepping down or auto shutdown of devices" -- NOT epp/kbd,
-    // user corrected those back out; NOT reclaim (this laptop's KWin is already iGPU-only, so the dGPU is D3cold
-    // regardless -- nothing to reclaim); NOT undervolt (stability, per-chip margin, stays manual/opt-in only).
-    // Investigated but dropped: SATA link-power-mgmt has no target on this NVMe-only laptop (no scsi_host exists);
-    // WiFi power-save needs real root (raw `iw` refuses as an unprivileged user, confirmed 2026-07-07) -- granting
-    // that sudo-less would mean a system-wide CAP_NET_ADMIN grant, a bigger footprint than this feature is worth.
-    // PCIe ASPM policy is a live nudge just like EPP -- TLP's own PCIE_ASPM_ON_AC/BAT (both "default" on this
-    // machine, see /etc/tlp.d/02-blade16.conf) can overwrite it again on the next AC<->BAT transition.
-    system(mode==2 ? "echo powersupersave > /sys/module/pcie_aspm/parameters/policy 2>/dev/null"
-                   : "echo default > /sys/module/pcie_aspm/parameters/policy 2>/dev/null");
-    return 0;
-}
-// ---- battery charge limit (opcode from Synapse USB capture 2026-06-12) ----
-static int get_charge_limit(int fd){ // raw byte: pct|0x80 when enabled, plain pct when disabled; <0 = error
-    unsigned char b[L],in[L],a[1]={0};
-    build(b,0x07,0x8f,0x01,a,1); if(xfer(fd,b,in)!=0x02) return -1; return in[9]; }
-static int set_charge_limit(int fd,int raw){ // raw = pct|0x80 to enable, pct (bit7 clear) to disable-keep-value
-    unsigned char a[1]={(unsigned char)raw};
-    if(snd(fd,0x07,0x12,0x01,a,1)!=0x02) return -1;     // 1) setter (0x07/0x12)
-    (void)get_charge_limit(fd);                          // 2) status read -- Synapse reads 0x07/0x8f between set & commit
-    unsigned char c[1]={0x02};                           // 3) COMMIT/APPLY: Synapse sends 0x07/0x0f arg 0x02 after EVERY
-    return snd(fd,0x07,0x0f,0x01,c,1)==0x02?0:-1; }      // battery write (decoded 2026-06-20). Without it the EC stores the value but never applies it -> charging never stops.
-static int kbd_off(int fd){ unsigned char a[3]={0x01,0x05,0x00}; return snd(fd,0x03,0x03,0x03,a,3)==0x02?0:-1; }
-static int kbd_color(int fd,int r,int g,int b){ // paint all 6 rows, commit, brightness 30%
-    for(int row=0;row<6;row++){
-        unsigned char a[52]; memset(a,0,sizeof a);
-        a[0]=0xff; a[1]=(unsigned char)row; a[3]=0x0f;
-        for(int k=0;k<15;k++){ a[7+k*3]=(unsigned char)r; a[7+k*3+1]=(unsigned char)g; a[7+k*3+2]=(unsigned char)b; }
-        if(snd(fd,0x03,0x0b,0x34,a,52)!=0x02) return -1;
-    }
-    unsigned char cm[2]={0x05,0x00}; snd(fd,0x03,0x0a,0x02,cm,2);   // commit custom frame
-    unsigned char br[3]={0x01,0x05,76}; snd(fd,0x03,0x03,0x03,br,3); // 30% = 76/255
-    return 0;
-}
+static int rpc_ok(const char*cmd){ char r[128]; return rpc(cmd,r,sizeof r); }
+// ---- reads (proxied to razerctld; `fd` kept as a parameter for source compat with
+// the TUI/CLI call sites below, but it's unused -- there's no local hidraw fd anymore) ----
+static int get_pmode(int fd){ (void)fd; char r[64]; if(rpc("STATUS",r,sizeof r)!=0) return -1;
+    int m; return sscanf(r,"OK mode=%d",&m)==1?m:-1; }
+static int get_fan_setpoint(int fd){ (void)fd; char r[64]; if(rpc("SETPOINT",r,sizeof r)!=0) return -1;
+    int sp; return sscanf(r,"OK %d",&sp)==1?sp:-1; }
+static int get_tach(int fd,int zone){ (void)fd; char r[64]; if(rpc("TACH",r,sizeof r)!=0) return -1;
+    int f1,f2; if(sscanf(r,"OK %d %d",&f1,&f2)!=2) return -1; return zone==1?f1:f2; }
+// ---- writes (each one round-trips to razerctld, which persists it to disk too) ----
+static int set_fan(int fd,int rpm){ (void)fd; char c[48]; snprintf(c,sizeof c,"FAN MANUAL %d",rpm); return rpc_ok(c); }
+static int set_fan_auto(int fd){ (void)fd; return rpc_ok("FAN AUTO"); }
+static int set_fan_curve(int fd){ (void)fd; return rpc_ok("FAN CURVE"); }
+static int set_pmode(int fd,int mode,int force_manual){ (void)fd; if(mode<0||mode>2) return -1;
+    char c[48]; snprintf(c,sizeof c,"MODE %d %d",mode,force_manual?1:0); return rpc_ok(c); }
+// ---- battery charge limit (persisted by razerctld) ----
+static int get_charge_limit(int fd){ (void)fd; char r[64]; if(rpc("BATTERYRAW",r,sizeof r)!=0) return -1;
+    int raw; return sscanf(r,"OK %d",&raw)==1?raw:-1; }
+static int set_charge_limit(int fd,int raw){ (void)fd; char c[48];
+    if(raw==0x41) snprintf(c,sizeof c,"BATTERY OFF"); else snprintf(c,sizeof c,"BATTERY %d",raw&0x7f);
+    return rpc_ok(c); }
 // Keyboard backlight presets (index 0 = off; cycled by TUI 'k', named by CLI `kbd`).
+// Defined before kbd_color() below since it needs to map an (r,g,b) triplet back to
+// razerctld's KBD index (the daemon owns the same table; this just has to agree with it).
 static const struct { const char*name; int r,g,b; } KBD[] = {
     {"off",-1,-1,-1}, {"white",255,255,255}, {"red",255,0,0}, {"purple",128,0,128}, {"green",0,255,0}
 };
 #define NKBD ((int)(sizeof KBD / sizeof KBD[0]))
+static int kbd_off(int fd){ (void)fd; return rpc_ok("KBD 0"); }
+static int kbd_color(int fd,int r,int g,int b){ (void)fd;
+    for(int i=0;i<NKBD;i++) if(KBD[i].r==r&&KBD[i].g==g&&KBD[i].b==b){ char c[16]; snprintf(c,sizeof c,"KBD %d",i); return rpc_ok(c); }
+    return -1;
+}
 static const char* modename(int m){return m==0?"Balanced":m==1?"Gaming":m==2?"Creator":"?";}
 // (Removed: reclaim_dgpu / KWin restart. We now reboot into an iGPU-only BIOS
 // state to park the dGPU, so restarting the compositor to "drop" the dGPU made
@@ -228,86 +152,10 @@ static int pkg_temp(void){
                 char lab[40]; rds(lp,lab,sizeof lab); if(strstr(lab,"Package")){ snprintf(path,sizeof path,"/sys/class/hwmon/hwmon%d/temp%d_input",h,t); break; } } } }
     if(!path[0])return -1; long long v=rdll(path); return v<0?-1:(int)(v/1000);
 }
-// ---------- custom fan curve (temp -> rpm, EMA-smoothed) ----------
-// Fan speed is driven purely by CPU package temp + dGPU temp. Each maps through a linear
-// ramp from a floor temp (pre-ramp -> FAN_RPM_ENGAGE) to its ALARM temp (-> FAN_RPM_MAX); the (shared)
-// fans take the LOUDER of the two demands. Temps are EMA-smoothed asymmetrically (ramp up
-// fast, spin down slow) to track load without hunting. At/above an alarm temp the RAW
-// (unsmoothed) reading forces full speed at once -- safety is never smoothed.
-#define FAN_RPM_IDLE   2200   // flat idle rpm below the pre-ramp (2026-06-10, ex 2000/2500)
-#define FAN_RPM_ENGAGE 2500   // rpm reached at the main floor temp (T_LO)
-#define FAN_RPM_MAX    4800   // real ceiling: EC caps manual fan ~4700rpm; 5300 command = identical tach (tested 2026-06-14). 5100 seen was firmware-auto under load
-#define PRE_T_BAND     10     // pre-ramp width: (T_LO-10)..T_LO eases IDLE->ENGAGE
-                              // (+30 rpm/C -- inaudible by design; CPU 55-65C, GPU 60-70C)
-#define CPU_T_LO 65      // CPU: fan floor / engage temp (C) -- flat 2500 below
-#define CPU_T_HI 90      // CPU: ALARM -> full speed (C)
-#define GPU_T_LO 70      // GPU: fan floor / engage temp (C) -- flat 2500 below
-#define GPU_T_HI 82      // GPU: ALARM -> full speed (C)
-#define EMA_UP   0.50    // smoothing weight when a temp is RISING  (responsive)
-#define EMA_DOWN 0.25    // smoothing weight when a temp is FALLING (spin-down speed)
-#define FAN_STEP 150     // min rpm change before issuing a new HID write (hysteresis)
-#define FAN_LOOP_S 2     // poll interval (s)
-static int dgpu_awake(void){ char s[16],p[300]; dgpu_path(p,sizeof p,"power_state"); rds(p,s,sizeof s); return !strcmp(s,"D0"); }
-// dGPU temp in C, or -1 if the dGPU is asleep/unreadable. Only shells out to nvidia-smi when
-// the GPU is ALREADY D0 -- an idle dGPU stays in D3cold and we must never wake it just to poll.
-static int gpu_temp(void){
-    if(!dgpu_awake()) return -1;
-    // `timeout 2` so a D0-but-wedged dGPU (driver hiccup) can't hang nvidia-smi and stall the TUI.
-    FILE*f=popen("/usr/bin/timeout 2 /usr/bin/nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null","r");
-    if(!f) return -1; int t=-1; if(fscanf(f,"%d",&t)!=1) t=-1; pclose(f); return t;
-}
-// Three segments: OFF (0, sentinel meaning "hand back to firmware AUTO") below (lo-PRE_T_BAND);
-// a gentle pre-ramp IDLE->ENGAGE across (lo-PRE_T_BAND)..lo; then the main ramp ENGAGE->MAX at the
-// alarm temp. The pre-ramp keeps the idle->engage transition inaudible.
-// 0 is a safe sentinel: nothing else in this curve ever legitimately outputs exactly 0 (the lowest
-// non-off value is FAN_RPM_IDLE=2200), so callers can branch `target==0` -> set_fan_auto(fd) instead
-// of `set_fan(fd,0)`. Verified 2026-07-07: commanding manual rpm=0 does NOT stop the fan -- the EC
-// floors manual mode at ~1900-2000rpm regardless (mirrors the already-known ~4700 ceiling clamp at
-// the top end). Only firmware AUTO's own thermal table can reach true 0rpm, so that's what "off"
-// has to mean here.
-static int curve_rpm(double t,double lo,double hi){
-    if(t<=lo-PRE_T_BAND) return 0;
-    if(t<lo) return FAN_RPM_IDLE +
-        (int)((FAN_RPM_ENGAGE-FAN_RPM_IDLE)*(t-(lo-PRE_T_BAND))/PRE_T_BAND+0.5);
-    if(t>=hi) return FAN_RPM_MAX;
-    return FAN_RPM_ENGAGE + (int)((FAN_RPM_MAX-FAN_RPM_ENGAGE)*(t-lo)/(hi-lo)+0.5);
-}
-// One curve tick: read CPU+dGPU temps, advance the two EMA states (*ec/*eg, asymmetric: fast up,
-// slow down), and return the target rpm (the LOUDER of the CPU/GPU demands; alarm forces FAN_RPM_MAX;
-// 0 = both sensors cool/asleep -> caller should hand off to AUTO, see curve_rpm above).
-// Outputs the raw temps (*ctp/*gtp; gt=-1 if the dGPU is asleep) and whether an alarm tripped (*alm).
-// Shared by the CLI `fancurve` loop and the TUI 'c' toggle so the two can never drift apart.
-static int curve_step(double*ec,double*eg,int*ctp,int*gtp,int*alm){
-    int ct=pkg_temp(), gt=gpu_temp(); *ctp=ct; *gtp=gt;
-    if(ct>=0){ if(*ec<0)*ec=ct; else *ec += ((ct>*ec)?EMA_UP:EMA_DOWN)*(ct-*ec); }
-    if(gt>=0){ if(*eg<0)*eg=gt; else *eg += ((gt>*eg)?EMA_UP:EMA_DOWN)*(gt-*eg); } else *eg=-1;
-    *alm=(ct>=CPU_T_HI)||(gt>=GPU_T_HI);             // raw temps; gt=-1 (asleep) can't trip it
-    int rc=(*ec>=0)?curve_rpm(*ec,CPU_T_LO,CPU_T_HI):0;   // unreadable/asleep = no demand, not a floor
-    int rg=(*eg>=0)?curve_rpm(*eg,GPU_T_LO,GPU_T_HI):0;
-    int t=rc>rg?rc:rg; if(*alm)t=FAN_RPM_MAX; return (t/100)*100;
-}
-static volatile sig_atomic_t curve_stop=0;
-static void curve_sigint(int s){ (void)s; curve_stop=1; }
-// Standalone foreground curve loop (CLI `fancurve`); the TUI 'c' toggle reuses curve_step() directly.
-static int fan_curve(int fd){
-    signal(SIGINT,curve_sigint);
-    printf("fan curve: CPU %d->%dC  GPU %d->%dC  =>  auto(0)/%d-%d rpm   (EMA up=%.2f down=%.2f)\n",
-           CPU_T_LO,CPU_T_HI,GPU_T_LO,GPU_T_HI,FAN_RPM_IDLE,FAN_RPM_MAX,EMA_UP,EMA_DOWN);
-    printf("alarm = full speed at CPU>=%dC or GPU>=%dC. Cool enough -> hands back to firmware AUTO (true 0rpm). Ctrl-C to stop.\n",CPU_T_HI,GPU_T_HI);
-    double ec=-1,eg=-1; int applied=-1;
-    while(!curve_stop){
-        int ct,gt,alarm; int target=curve_step(&ec,&eg,&ct,&gt,&alarm);
-        if(applied<0||alarm||abs(target-applied)>=FAN_STEP){
-            if(target==0){ if(set_fan_auto(fd)==0) applied=0; }
-            else if(set_fan(fd,target)==0) applied=target;
-        }
-        char gb[24]; if(gt>=0)snprintf(gb,sizeof gb,"%3dC(ema%5.1f)",gt,eg); else snprintf(gb,sizeof gb,"asleep       ");
-        printf("\rCPU %3dC(ema%5.1f)  GPU %s  -> %4d rpm %s ",ct,ec,gb,applied,alarm?"[ALARM]":"       ");
-        fflush(stdout);
-        for(int i=0;i<FAN_LOOP_S*10 && !curve_stop;i++) usleep(100000);   // sleep, stay Ctrl-C responsive
-    }
-    printf("\nrestoring fan to AUTO...\n"); set_fan_auto(fd); return 0;
-}
+// (The temp-driven fan curve -- CPU/GPU EMA smoothing, curve_rpm/curve_step, FAN_STEP/
+// FAN_LOOP_S -- now lives entirely in razerctld.c. It's an ongoing control loop that has
+// to keep running whether or not this client is attached, so it makes no sense client-side
+// anymore; `razerctl fan curve` / the TUI's Curve setting just tell the daemon "Curve" once.)
 static double cpu_busy(void){ static long long pt=-1,pi=-1;
     FILE*f=fopen("/proc/stat","r"); if(!f)return -1; char c[8]; long long u,n,sy,idle,io,ir,si,st;
     if(fscanf(f,"%7s %lld %lld %lld %lld %lld %lld %lld %lld",c,&u,&n,&sy,&idle,&io,&ir,&si,&st)!=9){fclose(f);return -1;} fclose(f);
@@ -544,24 +392,37 @@ static int readkey(void){
 #define MROWS 9
 #define DROWS 6
 
+// Pull razerctld's authoritative persisted state (mode/fanmode/fanrpm/kbd/battery) once
+// at TUI startup, so opening the dashboard reflects whatever's actually running instead
+// of guessing/forcing defaults -- the whole point of the daemon is that it keeps whatever
+// was last set, TUI open or not.
+static int status_pull(int*mode,int*fanmode,int*fanrpm,int*kbd,int*battery){
+    char r[160]; if(rpc("STATUS",r,sizeof r)!=0) return -1;
+    return sscanf(r,"OK mode=%d fanmode=%d fanrpm=%d kbd=%d battery=%d",mode,fanmode,fanrpm,kbd,battery)==5?0:-1;
+}
+static int batti_from_pct(const int*BP,int n,int battery){
+    for(int i=0;i<n;i++) if(BP[i]==(battery<0?0:battery)) return i; return 0;
+}
 static int tui(int fd,const char*node){
     int manual=0,rpm=4000; char msg[160]="";
-    int fanmode=2,alarm=0,capplied=-1; double ec=-1,eg=-1;  // fanmode 0=Auto 1=Manual 2=Curve (startup Curve)
-    set_pmode(fd,0,0); kbd_off(fd);                          // startup defaults: Balanced + kbd off, fan not forced manual
-    int pm=get_pmode(fd), sp=get_fan_setpoint(fd);
+    static const int BP[NBATT]={0,60,70,80};
+    int pm=0,fanmode=0,fanrpm=4000,kbi=0,battery=-1;
+    if(status_pull(&pm,&fanmode,&fanrpm,&kbi,&battery)==0){ rpm=fanrpm; }
+    else snprintf(msg,sizeof msg,"razerctld unreachable -- showing stale/default state");
+    manual=(fanmode==1);
+    int sp=get_fan_setpoint(fd);
     long long pe=-1,ce=-1; double pts=0,cts=0; int ncpu=(int)sysconf(_SC_NPROCESSORS_ONLN); int mon=1;
-    int kbi=0; int powerd_on=powerd_enabled(); int eppi=epp_nearest(get_epp(NULL,0)); int batti=0;
+    int powerd_on=powerd_enabled(); int eppi=epp_nearest(get_epp(NULL,0));
+    int batti=batti_from_pct(BP,NBATT,battery);
     int page=0, sel=0, dsel=0;                               // page 0=main 1=dGPU undervolt
     int uv_mv=0, minf=1695, maxf=2400, nv_applied=0, nv_started=0; char nverr[80]="";  // sensible starts (15MHz-aligned): floor 1695, ceiling 2400
-    static const int BP[NBATT]={0,60,70,80};
     // Telemetry is cached and refreshed at most once per POLL_S; redraws/keypresses reuse the
     // cache so navigation stays snappy and the delta metrics (W, busy%) keep a steady window.
     #define POLL_S 5.0
     int f1=-1,f2=-1,temp=-1,ac=-1,meanf=-1,maxf_f=-1; double bw=0,pkgw=-1,corew=-1,busy=-1,deep=-1;
-    char gst[32]="?",gps[16]="?",bstatus[24]="?"; double last_poll=-1, last_curve=-1;
+    char gst[32]="?",gps[16]="?",bstatus[24]="?"; double last_poll=-1;
     raw_on();
     for(;;){
-        int curve=(fanmode==2);
         // ---- telemetry (throttled to POLL_S) ----
         if(mon && page==0 && (last_poll<0 || mono()-last_poll>=POLL_S)){
             last_poll=mono();
@@ -572,16 +433,9 @@ static int tui(int fd,const char*node){
             corew=rapl_w("/sys/class/powercap/intel-rapl:0:0/energy_uj",&ce,&cts);
             temp=pkg_temp(); busy=cpu_busy(); deep=deep_res(ncpu); cpu_freq(ncpu,&meanf,&maxf_f);
             powerd_on=powerd_enabled();
+            sp=get_fan_setpoint(fd);
+            if(fanmode!=1) rpm=sp;   // Auto/Curve: show the daemon's live setpoint, not a stale local guess
         }
-        // Fan-curve tick is gated to FAN_LOOP_S regardless of how often the loop wakes (keypresses,
-        // page redraws), so navigation never triggers an nvidia-smi spawn or a burst of EC writes.
-        if(curve){ if(last_curve<0 || mono()-last_curve>=FAN_LOOP_S){ last_curve=mono();
-            int ct,gt; rpm=curve_step(&ec,&eg,&ct,&gt,&alarm); (void)ct;(void)gt;
-            if(capplied<0||alarm||abs(rpm-capplied)>=FAN_STEP){
-                if(rpm==0){ if(set_fan_auto(fd)==0) capplied=0; }
-                else if(set_fan(fd,rpm)==0) capplied=rpm;
-            } } }
-        else alarm=0;
 
         // ---- render ----
         if(page==0){
@@ -591,8 +445,7 @@ static int tui(int fd,const char*node){
             if(mon){
                 { const char*bcol=!strcmp(bstatus,"Discharging")?"\033[1;31m":"\033[1;33m";
                   const char*blabel=bstatus[0]?bstatus:(ac?"AC":"BAT");   // fallback only if /status is unreadable
-                  printf("   Fan RPM  \033[1;32m%4d / %4d\033[0m   Batt %s%s %.1fW\033[0m%s\033[K\n",f1,f2,bcol,blabel,bw,
-                      alarm?"  \033[1;31m[ALARM]\033[0m":""); }
+                  printf("   Fan RPM  \033[1;32m%4d / %4d\033[0m   Batt %s%s %.1fW\033[0m\033[K\n",f1,f2,bcol,blabel,bw); }
                 { int gone=(gst[0]==0); int asleep=gone||(strcmp(gst,"suspended")==0);
                   printf("   dGPU     %s%s\033[0m   CPU \033[1;33m%dC %.0fW\033[0m   busy \033[1;33m%.0f%%\033[0m\033[K\n",
                       asleep?"\033[1;32m":"\033[1;31m", gone?"absent ~0W":(asleep?"asleep ~0W":"AWAKE"),temp,pkgw,busy); }
@@ -642,24 +495,25 @@ static int tui(int fd,const char*node){
         fflush(stdout);
 
         // ---- input ----
-        // Sleep only until the next thing actually falls due (telemetry @POLL_S, curve @FAN_LOOP_S,
-        // dGPU page @1s live voltage); a keypress wakes us early regardless. This avoids a fixed
-        // busy-redraw cadence (screen flicker / wasted work) while keeping refreshes on schedule.
+        // Sleep only until the next thing actually falls due (telemetry @POLL_S, dGPU page @1s
+        // live voltage); a keypress wakes us early regardless. The fan curve no longer ticks here
+        // -- razerctld drives it in the background, TUI open or not.
         double wait;
         if(page){ wait=1.0; }
         else {
             wait=POLL_S;
             if(mon && last_poll>=0){ double w=last_poll+POLL_S-mono(); if(w<wait) wait=w; }
-            if(curve){ double w=(last_curve<0)?0:last_curve+FAN_LOOP_S-mono(); if(w<wait) wait=w; }
             if(wait<0.1) wait=0.1; if(wait>POLL_S) wait=POLL_S;
         }
         struct timeval tv={(int)wait,(int)((wait-(int)wait)*1e6)};
         fd_set r; FD_ZERO(&r); FD_SET(0,&r);
-        if(select(1,&r,0,0, (mon||curve||page)?&tv:NULL)<=0) continue;
+        if(select(1,&r,0,0, (mon||page)?&tv:NULL)<=0) continue;
         msg[0]=0; int k=readkey();
 
         if(page==0){
-            if(k=='q'){ if(fanmode==2) set_fan_auto(fd); break; }
+            // Quitting the TUI no longer forces fan mode back to Auto -- razerctld keeps
+            // running Curve/Manual/whatever was set in the background after this exits.
+            if(k=='q'){ break; }
             else if(k==K_UP){ sel=(sel+MROWS-1)%MROWS; }
             else if(k==K_DOWN){ sel=(sel+1)%MROWS; }
             else if(k==K_ENTER){
@@ -672,9 +526,9 @@ static int tui(int fd,const char*node){
                 else if(sel==0){ int w=(pm+dir+3)%3; set_pmode(fd,w,fanmode==1); pm=get_pmode(fd); powerd_on=powerd_enabled();
                     snprintf(msg,sizeof msg,"mode -> %s",modename(pm)); }
                 else if(sel==1){ fanmode=(fanmode+dir+3)%3;
-                    if(fanmode==0){ manual=0; set_fan_auto(fd); capplied=-1; snprintf(msg,sizeof msg,"fan Auto"); }
+                    if(fanmode==0){ manual=0; set_fan_auto(fd); snprintf(msg,sizeof msg,"fan Auto"); }
                     else if(fanmode==1){ manual=1; set_fan(fd,rpm); snprintf(msg,sizeof msg,"fan Manual %d",rpm); }
-                    else { manual=0; ec=eg=-1; capplied=-1; snprintf(msg,sizeof msg,"fan Curve (temp-driven)"); }
+                    else { manual=0; set_fan_curve(fd); snprintf(msg,sizeof msg,"fan Curve (temp-driven, runs in razerctld)"); }
                     sp=get_fan_setpoint(fd); }
                 else if(sel==2){ if(fanmode==1){ rpm+=dir*500; if(rpm>4800)rpm=4800; if(rpm<2000)rpm=2000;
                     set_fan(fd,rpm); sp=get_fan_setpoint(fd); snprintf(msg,sizeof msg,"rpm %d",rpm); }
@@ -693,9 +547,9 @@ static int tui(int fd,const char*node){
                     else snprintf(msg,sizeof msg,"charge limit OFF (100%%)"); }
             }
         } else {  // dGPU undervolt page
-            int can_edit=(geteuid()==0); // always true — main() requires root
+            int can_edit=(geteuid()==0); // only the undervolt Apply/Reset needs root now -- run `sudo razerctl` for this page
             if(k==K_ESC){ page=0; last_poll=-1; }
-            else if(k=='q'){ if(fanmode==2) set_fan_auto(fd); break; }
+            else if(k=='q'){ break; }
             else if(k==K_UP){ dsel=(dsel+DROWS-1)%DROWS; }
             else if(k==K_DOWN){ dsel=(dsel+1)%DROWS; }
             else if((k==K_ENTER&&dsel==5)){ page=0; last_poll=-1; }   // Back works without root
@@ -723,34 +577,12 @@ static int tui(int fd,const char*node){
     if(NV.ok){ nv_reset(); nv_unlock(); }   // leave the GPU at stock on exit (curve + clock clamp; both reset on reboot anyway)
     raw_off(); return 0;
 }
-// Single-instance guard. Two razerctl processes doing interleaved hidraw feature-reports
-// on the same EC cross each other's responses -> corrupt readbacks / false "setter failed"
-// (e.g. an open TUI vs a CLI invocation). Take a non-blocking exclusive flock at startup;
-// the fd is intentionally kept open for the process lifetime (kernel drops the lock on exit,
-// even on crash/kill -- no stale lock). Returns 0 if we hold it (or the lock is unusable, in
-// which case we don't block the tool), -1 if another instance already holds it.
-static int single_instance(void){
-    int fd=open("/tmp/razerctl.lock",O_RDWR|O_CREAT,0666);
-    if(fd<0) return 0;                                   // can't lock -> don't block functionality
-    if(flock(fd,LOCK_EX|LOCK_NB)==0){
-        char b[16]; int n=snprintf(b,sizeof b,"%d\n",(int)getpid());
-        if(ftruncate(fd,0)==0){ ssize_t w=write(fd,b,n); (void)w; }
-        return 0;                                        // fd leaked on purpose -> lock held until exit
-    }
-    if(errno==EWOULDBLOCK||errno==EAGAIN){
-        char b[16]={0}; int other=0; if(pread(fd,b,sizeof b-1,0)>0) other=atoi(b);
-        if(other>0) fprintf(stderr,"razerctl: another instance is already running (PID %d).\n",other);
-        else        fprintf(stderr,"razerctl: another instance is already running.\n");
-        fprintf(stderr,"Refusing to start -- concurrent EC access corrupts readings. Quit the other one first.\n");
-        close(fd); return -1;
-    }
-    close(fd); return 0;                                 // unexpected flock error -> don't block
-}
 int main(int argc,char**argv){
-    if(geteuid()!=0){ fprintf(stderr,"razerctl needs root. Run: sudo razerctl\n"); return 1; }
     // dGPU undervolt CLI (no EC/hidraw needed; NvAPI enumerates the GPU by device,
-    // so it's immune to PCI-address changes across boots).
+    // so it's immune to PCI-address changes across boots). This is the one client
+    // feature that still touches real hardware directly and still needs root to WRITE.
     if(argc>=2 && !strcmp(argv[1],"--uv-apply")){           // headless re-apply (systemd unit)
+        if(geteuid()!=0){ fprintf(stderr,"razerctl --uv-apply needs root\n"); return 1; }
         int mv,minf,maxf; if(uv_load(&mv,&minf,&maxf)!=0){ printf("no undervolt profile\n"); return 0; }
         if(nv_init()!=0){ printf("dGPU absent (iGPU-only boot?) - undervolt skipped\n"); return 0; }  // graceful no-op
         int r=nv_write_uv(mv,minf); int lr=0;
@@ -775,9 +607,13 @@ int main(int argc,char**argv){
         printf("applied -%dmV >%dMHz (%d pts, +%dMHz)%s; profile saved (persists at login)\n",mv,minf,c,pk,(maxf&&lr==0)?", capped":"");
         return 0;
     }
-    if(single_instance()<0) return 3;
-    char node[64]="?"; int fd=open_dev(node);
-    if(fd<0){ fprintf(stderr,"razerctl: no responding 1532:02b7 hidraw (root? udev rule?)\n"); return 2; }
+    // Everything else talks to razerctld over the socket -- no hidraw fd here anymore, so no
+    // root and no single-instance lock needed (the daemon serializes EC access by itself).
+    { char pr[64]; if(rpc("PING",pr,sizeof pr)!=0){
+        fprintf(stderr,"razerctl: can't reach razerctld (%s) -- is it running?\n",RAZERCTLD_SOCK);
+        fprintf(stderr,"  try: sudo systemctl start razerctld\n");
+        return 2; } }
+    int fd=0; char node[64]="razerctld";
     if(argc==1) return tui(fd,node);
     if(!strcmp(argv[1],"nvtest")){
         if(nv_init()!=0){ printf("nv_init FAILED\n"); return 1; }
@@ -859,8 +695,16 @@ int main(int argc,char**argv){
             printf("nvidia-powerd %s -> %s\n", a, r==0?"ok":"failed (polkit rule missing?)");
         } else { fprintf(stderr,"powerd: on|off|status\n"); return 1; }
         } else if(!strcmp(argv[1],"fancurve")||!strcmp(argv[1],"autofan")){
-        // temp-driven fan loop: CPU + dGPU temp -> rpm via EMA-smoothed curves; Ctrl-C restores AUTO.
-        return fan_curve(fd);
+        // Curve mode now runs inside razerctld: tell it once, then just watch. Unlike the old
+        // foreground loop, Ctrl-C here does NOT revert to Auto -- the daemon keeps curving after
+        // this process exits (that's the whole point of moving it server-side).
+        if(set_fan_curve(fd)!=0){ fprintf(stderr,"failed to enable curve mode (razerctld unreachable?)\n"); return 1; }
+        printf("fan curve enabled in razerctld (temp-driven, persists across reboots until changed).\n");
+        printf("watching live setpoint @2s (Ctrl-C to stop watching -- curve keeps running in the background)...\n");
+        for(;;){
+            printf("\rfan1=%4d fan2=%4d rpm | setpoint=%-4d ",get_tach(fd,1),get_tach(fd,2),get_fan_setpoint(fd));
+            fflush(stdout); sleep(2);
+        }
     } else if(!strcmp(argv[1],"power")&&argc==3){
         // max: enable nvidia-powerd (Dynamic Boost) + raise TDP to card max.
         // save: disable powerd + reset TDP to driver default.

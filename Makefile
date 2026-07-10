@@ -1,28 +1,30 @@
 CC ?= gcc
 CFLAGS ?= -O2 -Wall
 LDLIBS ?= -ldl
-all: razerctl
-razerctl: razerctl.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+all: razerctl razerctld
+razerctl: razerctl.c razer_ipc.h
+	$(CC) $(CFLAGS) -o $@ razerctl.c $(LDLIBS)
+razerctld: razerctld.c razer_ipc.h
+	$(CC) $(CFLAGS) -o $@ razerctld.c
 PREFIX ?= /usr/local
-UDEVRULE = /etc/udev/rules.d/99-razerctl.rules
-# One-shot setup (run with sudo). Installs the binary, then makes it sudo-less:
-#  - udev uaccess rule -> your user can talk to the Razer HID (fans/mode/kbd/etc.)
-#  - cap_sys_admin     -> the dGPU undervolt (NvAPI clock-table write) needs it
-# Caps drop on copy, so they MUST be re-applied on every install.
-# (The dGPU MAX-FREQ cap still needs real root -- cap_sys_admin isn't enough for it.)
-install: razerctl
+UNITDIR = /etc/systemd/system
+# razerctld (daemon, root, owns hidraw+EC) runs as a system service; razerctl (client,
+# TUI/CLI) is a plain unprivileged binary that talks to it over /run/razerctld.sock --
+# no udev rule / setcap needed anymore, the client never touches hidraw directly.
+install: razerctl razerctld
 	install -m755 razerctl $(PREFIX)/bin/razerctl
-	setcap cap_sys_admin+epi $(PREFIX)/bin/razerctl
+	install -m755 razerctld $(PREFIX)/bin/razerctld
 	install -Dm644 razerctl.1 $(PREFIX)/share/man/man1/razerctl.1
-	printf '%s\n' 'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="02b7", MODE="0660", TAG+="uaccess"' > $(UDEVRULE)
-	udevadm control --reload-rules && udevadm trigger || true
-	@echo "installed $(PREFIX)/bin/razerctl + man page + udev rule. Re-plug or re-login if it can't reach the device yet."
+	install -Dm644 razerctld.service $(UNITDIR)/razerctld.service
+	systemctl daemon-reload
+	systemctl enable --now razerctld
+	@echo "installed $(PREFIX)/bin/razerctl + razerctld + man page. razerctld is enabled+running (state in /etc/razerctld/state.conf)."
 
 uninstall:
-	rm -f $(PREFIX)/bin/razerctl $(PREFIX)/share/man/man1/razerctl.1 $(UDEVRULE)
-	udevadm control --reload-rules || true
+	systemctl disable --now razerctld || true
+	rm -f $(PREFIX)/bin/razerctl $(PREFIX)/bin/razerctld $(PREFIX)/share/man/man1/razerctl.1 $(UNITDIR)/razerctld.service
+	systemctl daemon-reload || true
 
 clean:
-	rm -f razerctl burn *.o
+	rm -f razerctl razerctld burn *.o
 .PHONY: all clean install uninstall

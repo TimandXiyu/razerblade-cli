@@ -1,0 +1,14 @@
+[Unit]
+Description=Razer Blade 16 EC daemon (fan/perf/kbd/battery-limit, persists across boots)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/razerctld
+Restart=on-failure
+RestartSec=2
+# Retries a few times if hidraw isn't enumerated yet at boot (razerctld itself also
+# retries open_dev() for ~30s before exiting 2, so this is a second-line backstop).
+
+[Install]
+WantedBy=multi-user.target

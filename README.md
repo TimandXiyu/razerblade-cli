@@ -1,13 +1,21 @@
 # razerctl — a tiny Razer Blade 16 control tool for Linux
 
-`razerctl` is a small, dependency-free **C** program that lets you control a
-**Razer Blade 16** from the Linux terminal — fans, performance mode, keyboard
-backlight, battery charge limit, and even an **NVIDIA dGPU undervolt** — plus a
-live power dashboard. No daemon, no Python, no Synapse. It talks Razer's USB-HID
-protocol straight over `hidraw`.
+`razerctl` lets you control a **Razer Blade 16** from the Linux terminal —
+fans, performance mode, keyboard backlight, battery charge limit, and even an
+**NVIDIA dGPU undervolt** — plus a live power dashboard. No Python, no Synapse.
 
-Think of it as a few hundred lines of C doing what Synapse does, minus the heavy
-GUI.
+It's two small, dependency-free **C** programs:
+
+- **`razerctld`** — a background daemon (systemd system service, root) that
+  owns the Razer USB-HID device and the temp-driven fan curve. It persists
+  your perf mode, fan mode, keyboard backlight, and battery charge limit to
+  disk and re-applies them at boot, and keeps them consistent in the
+  background whether or not anything is watching.
+- **`razerctl`** — the CLI/TUI **client**, unprivileged, talking to the daemon
+  over a local socket. This is what you actually run day to day.
+
+Think of it as a few hundred lines of C doing what Synapse does, minus the
+heavy GUI.
 
 > ⚠️ **Unofficial and reverse-engineered.** Built and tested on one machine: a
 > Razer Blade 16 (2024, USB `1532:02b7`) running CachyOS (Arch-based). Opcodes
@@ -65,38 +73,30 @@ cmake --build build
 sudo cmake --install build
 ```
 
-Both produce the same `razerctl` in `/usr/local/bin` and set up sudo-less access.
+Both install `razerctl` + `razerctld` in `/usr/local/bin`, and enable+start
+`razerctld` as a systemd service (`systemctl status razerctld` to check).
 
 Try it:
 
 ```sh
-razerctl get           # prints your perf mode + fan setpoint
+razerctl get           # prints your perf mode + fan setpoint -- no sudo needed
 razerctl               # no arguments → launches the dashboard
 ```
 
 If `razerctl get` prints your mode and fan setpoint, you're good. 🎉
 
-> **No `make install`?** You can run it straight from the folder with `sudo
-> ./razerctl get`. But `make install` is recommended — it puts `razerctl` on your
-> `PATH` and grants the one capability the dGPU undervolt needs (see below).
-
 ### Running without `sudo`
 
-`make install` already sets things up so fans, perf mode, keyboard, and the dGPU
-**undervolt** all work without `sudo`. Under the hood it installs a udev rule so
-your user can talk to the Razer HID device, and gives the binary the
-`cap_sys_admin` capability the GPU clock write needs. If you ever want the udev
-rule by itself:
+`razerctld` (the daemon) is the only thing that touches the Razer HID device,
+and it runs as root via systemd — so `razerctl` itself (fans, perf mode,
+keyboard, battery limit, the dashboard) never needs `sudo`. It talks to the
+daemon over `/run/razerctld.sock`, which is world-writable on the assumption
+this is a single-user laptop.
 
-```sh
-sudo tee /etc/udev/rules.d/99-razerctl.rules >/dev/null <<'EOF'
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="02b7", MODE="0660", TAG+="uaccess"
-EOF
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
-
-The **one exception** is the dGPU **max-frequency cap**, which needs real root —
-see [Undervolting the dGPU](#undervolting-the-dgpu).
+The **one exception** is the dGPU **undervolt** page/subcommand (`razerctl uv
+...`) — that's unrelated to the daemon, drives NVIDIA's NvAPI directly, and
+still needs `sudo razerctl` to actually write a curve (reading is fine
+unprivileged). See [Undervolting the dGPU](#undervolting-the-dgpu).
 
 ---
 
@@ -174,12 +174,18 @@ a quick usage line).
 ## How it works
 
 Razer routes fan / perf / RGB control through 90-byte USB-HID feature reports
-(the openrazer format) to the keyboard MCU — **not** the ACPI EC. `razerctl`
-builds those reports and sends them via `HIDIOCSFEATURE` / `HIDIOCGFEATURE`. The
-dGPU undervolt is separate: it drives NVIDIA's undocumented NvAPI through
-`libnvidia-api.so` (the same interface Afterburner uses on Windows) to read and
-rewrite the per-point clock table, with NVML for clock/power/temperature
-readouts and the optional locked-clock cap.
+(the openrazer format) to the keyboard MCU — **not** the ACPI EC. `razerctld`
+builds those reports and sends them via `HIDIOCSFEATURE` / `HIDIOCGFEATURE`; the
+temp-driven fan curve also lives there, since it's an ongoing control loop that
+has to keep running whether or not `razerctl` is open. `razerctl` never opens
+hidraw at all — it sends line-based commands over a UNIX socket and gets a
+response back (see `razer_ipc.h` for the socket path; the protocol is a plain
+`VERB args\n` → `OK/ERR ...\n` request/response, one round-trip per command). The
+dGPU undervolt is separate from all of this: it drives NVIDIA's undocumented
+NvAPI through `libnvidia-api.so` (the same interface Afterburner uses on
+Windows) to read and rewrite the per-point clock table, with NVML for
+clock/power/temperature readouts and the optional locked-clock cap — that part
+stays in `razerctl` directly, unrelated to the daemon.
 
 ---
 

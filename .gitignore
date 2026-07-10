@@ -1,5 +1,6 @@
 # build artifacts
 razerctl
+razerctld
 burn
 *.o
 build/

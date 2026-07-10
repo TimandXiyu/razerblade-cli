@@ -10,12 +10,17 @@ With no arguments,
 launches an interactive terminal dashboard (TUI).
 .SH DESCRIPTION
 .B razerctl
-is a small, dependency-free tool that controls a Razer Blade 16 by speaking
-Razer's USB-HID vendor protocol directly over
-.IR hidraw .
-It can set the performance mode, fan speed (fixed, auto, or a temperature-driven
-curve), keyboard backlight, battery charge limit, and CPU energy bias, and it can
-undervolt the NVIDIA dGPU via a per-point voltage/frequency curve.
+is the client for
+.BR razerctld (8),
+a background daemon that speaks Razer's USB-HID vendor protocol directly over
+.IR hidraw
+and owns the fan, performance mode, keyboard backlight, and battery charge
+limit \(em persisting them to disk and re-applying them at boot. This client
+is unprivileged: it sends commands to
+.B razerctld
+over a local socket and never needs root, except for the dGPU undervolt
+subcommand/page (see below), which is unrelated to the daemon and talks to
+NVIDIA's NvAPI directly.
 .PP
 It is unofficial and reverse-engineered, developed and tested on a 2024 Razer
 Blade 16 (USB id \fB1532:02b7\fR). Opcodes can differ across models and firmware.
